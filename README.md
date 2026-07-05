@@ -1,36 +1,91 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Figma Copy
 
-## Getting Started
+Веб-приложение для копирования дизайнов из Figma — целиком или по блокам — с
+живым превью и генерацией кода **React + Tailwind** (и чистого HTML).
 
-First, run the development server:
+## Как пользоваться
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+1. Получите **personal access token** в Figma:
+   Settings → Security → *Personal access tokens* → создать.
+   (https://www.figma.com/developers/api#access-tokens)
+2. `npm run dev` и откройте http://localhost:3000
+3. Вставьте токен и ссылку на файл. Чтобы взять конкретный блок —
+   копируйте ссылку прямо на выбранный фрейм (она содержит `?node-id=…`).
+4. Кликайте по слоям слева → смотрите превью → копируйте код справа.
+
+Токен и ссылка хранятся только в `localStorage` вашего браузера; запросы к
+Figma идут через серверные роуты, токен не попадает в публичный бандл.
+
+### Режим «Плагин» — без токена и без лимитов (рекомендуется)
+
+Companion-плагин рендерит ассеты **локально внутри Figma** (`exportAsync`) и шлёт
+готовый дизайн в приложение — REST API и его rate-limit (429) не задействованы вовсе.
+
+1. В Figma: *Plugins → Development → Import plugin from manifest…* и выберите
+   `figma-plugin/manifest.json` из этого репозитория (одноразово).
+2. Запустите приложение (`npm run dev`, http://localhost:3000) и переключите
+   тумблер в шапке на **Плагин** — индикатор станет зелёным «Жду данные из плагина».
+3. В Figma выделите блок (или несколько) → запустите плагин
+   *«Figma Copy — Send to app»* → **Отправить выбранное**.
+4. Дизайн, дерево слоёв и ассеты мгновенно появятся в приложении.
+
+> Порт по умолчанию `http://localhost:3000` — если запускаете на другом,
+> поправьте `networkAccess.allowedDomains` в `manifest.json` и поле адреса в плагине.
+
+## Архитектура
+
+```
+src/
+  lib/figma/
+    types.ts     — типы узлов Figma REST API
+    client.ts    — обёртка над api.figma.com (files / nodes / images)
+    convert.ts   — Figma-узел → React+Tailwind и HTML (auto-layout → flex,
+                   свободное позиционирование → absolute)
+    tree.ts      — построение дерева слоёв и поиск узла по id
+  app/
+    api/figma/file/route.ts    — загрузка файла/узла (токен на сервере)
+    api/figma/images/route.ts  — рендер PNG-превью узлов
+    page.tsx                   — UI: ввод → дерево → превью → код
+  components/
+    LayerTree.tsx, PreviewPanel.tsx, CodePanel.tsx
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Что уже есть (MVP)
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+- Загрузка файла или конкретного блока по ссылке.
+- Дерево слоёв с навигацией.
+- Превью: картинка из Figma **и** живой рендер сгенерированного кода (iframe + Tailwind CDN) для сравнения.
+- Код: React+Tailwind / HTML, копирование в один клик.
+- Конвертация auto-layout → flexbox, цветов, скруглений, границ, теней, текста.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Дорожная карта
 
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- [x] Экспорт ассетов (иконки → инлайн-SVG, картинки → PNG) с подстановкой реальных `<img>`.
+- [x] Экспорт дизайн-токенов (цвета/типографика/отступы) в CSS-переменные, Tailwind v4 `@theme` и JSON.
+- [x] Множественный выбор блоков (режимы «собрать в один» / «отдельные компоненты»).
+- [x] Monaco-редактор с подсветкой синтаксиса.
+- [x] Устойчивость к rate-limit Figma: серверная очередь, чанкинг, backoff с джиттером.
+- [x] Companion-плагин Figma: ввод без токена и без лимитов (локальный `exportAsync` + SSE).
+- [x] Семантические теги (`button` / `h1`–`h6` / `a`) и токены прямо в коде (`bg-purple-500`).
+- [x] Форматы вывода: React + Tailwind, HTML, **Vue 3 SFC**, **React + CSS-modules**.
+- [x] Экспорт в zip (все форматы + ассеты + `tokens.css`).
+- [x] Редактируемый Monaco с запоминанием правок per-node (с кнопкой сброса).
+- [x] Кэш загруженных файлов и история (восстановление без обращения к REST API).
+- [x] Точность конвертации: поворот (`rotate`), размытие слоя/фона (`blur`/`backdrop-blur`),
+      несколько теней сразу, реальный угол линейного градиента.
+- [x] Смешанное форматирование текста (жирное слово, ссылка, цвет внутри абзаца) →
+      вложенные `<span>` без потери emphasis.
+- [x] Плагин: прогресс экспорта ассетов, живой счётчик выделения, сводка (слои/ассеты/размер),
+      запоминание адреса приложения между запусками.
+- [x] **Дизайн-токены из Figma variables**: `boundVariables` → реальные имена (`bg-primary-500`,
+      `gap-md`, `rounded-lg`) вместо угаданных по hex, с автоматическим `@theme` и режимом токенов.
+- [x] **Фоновые фото контейнеров**: плагин экспортирует заливку отдельно (скрывая детей) →
+      настоящий `background-image` вместо серой заглушки.
+- [x] **strokeAlign OUTSIDE** → `outline` (не съедает габариты, как CSS-border).
+- [x] **Constraints → адаптивность**: `MAX`→пин справа/снизу, `LEFT_RIGHT`→растяжение (`left`+`right`
+      без фикс-ширины), `CENTER`→`translate`, `SCALE`→проценты.
+- [x] **Провенанс компонентов**: имя `mainComponent` и `variantProperties` инстансов (основа для
+      компонентизации; уже улучшает имена компонентов/классов).
+- [x] **Устойчивость flex-раскладки**: `shrink-0` на каждом не-`Fill` ребёнке auto-layout —
+      как в Figma элементы не сжимаются, и структура не «съезжает» при масштабировании контейнера.
+- [x] Юнит-тесты конвертера (`npm test`, vitest) на градиенты, тени, поворот, токены, constraints, flex.

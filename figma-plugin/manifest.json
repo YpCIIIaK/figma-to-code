@@ -1,0 +1,12 @@
+{
+  "name": "Figma Copy — Send to app",
+  "id": "figma-copy-companion",
+  "api": "1.0.0",
+  "main": "code.js",
+  "ui": "ui.html",
+  "editorType": ["figma"],
+  "networkAccess": {
+    "allowedDomains": ["http://localhost:3000"],
+    "reasoning": "Sends the selected design to the local Figma Copy app for code generation."
+  }
+}

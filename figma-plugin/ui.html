@@ -1,0 +1,177 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body {
+        font: 12px -apple-system, Segoe UI, sans-serif;
+        margin: 0;
+        padding: 14px;
+        color: #1a1a1a;
+      }
+      h1 { font-size: 13px; margin: 0 0 10px; }
+      label { display: block; font-size: 11px; color: #666; margin: 10px 0 4px; }
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 6px 8px;
+        border: 1px solid #ddd;
+        border-radius: 6px;
+        font: inherit;
+      }
+      button {
+        width: 100%;
+        margin-top: 12px;
+        padding: 9px;
+        border: 0;
+        border-radius: 6px;
+        background: #7c6cff;
+        color: #fff;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button:disabled { opacity: 0.5; cursor: default; }
+      #status { margin-top: 10px; font-size: 11px; min-height: 16px; }
+      .ok { color: #1a8a4a; }
+      .err { color: #c0392b; }
+      .muted { color: #888; }
+    </style>
+  </head>
+  <body>
+    <h1>Отправить выбранное в Figma Copy</h1>
+    <label>Адрес приложения</label>
+    <input id="endpoint" value="http://localhost:3000" />
+    <button id="send" disabled>Отправить выбранное</button>
+    <div id="status" class="muted">Выберите блок в Figma и нажмите кнопку.</div>
+    <div id="stats" class="muted" style="margin-top: 6px; font-size: 11px;"></div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const status = (msg, cls) => {
+        $("status").textContent = msg;
+        $("status").className = cls || "muted";
+      };
+
+      function sanitizeSvg(raw) {
+        return raw
+          .replace(/<\?xml[^>]*\?>/i, "")
+          .replace(/<!--[\s\S]*?-->/g, "")
+          .replace(/\s(width|height)="[^"]*"/gi, "")
+          .trim();
+      }
+
+      function bytesToBase64(bytes) {
+        let bin = "";
+        const chunk = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunk) {
+          bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+        }
+        return btoa(bin);
+      }
+
+      let selectionCount = 0;
+
+      $("send").onclick = () => {
+        if (!selectionCount) return;
+        $("send").disabled = true;
+        status("Готовлю выбранное…");
+        parent.postMessage({ pluginMessage: { type: "send" } }, "*");
+      };
+
+      // Persist the app address as you type it (debounced).
+      let saveTimer;
+      $("endpoint").oninput = () => {
+        clearTimeout(saveTimer);
+        saveTimer = setTimeout(() => {
+          parent.postMessage(
+            { pluginMessage: { type: "saveEndpoint", endpoint: $("endpoint").value } },
+            "*",
+          );
+        }, 400);
+      };
+
+      onmessage = async (event) => {
+        const msg = event.data.pluginMessage;
+        if (!msg) return;
+
+        if (msg.type === "endpoint") {
+          if (msg.endpoint) $("endpoint").value = msg.endpoint;
+          return;
+        }
+        if (msg.type === "selection") {
+          selectionCount = msg.count;
+          $("send").disabled = !selectionCount;
+          if (!document.querySelector("#status").classList.contains("err"))
+            status(
+              selectionCount
+                ? "Выбрано блоков: " + selectionCount + " — можно отправлять."
+                : "Выберите блок в Figma.",
+            );
+          return;
+        }
+        if (msg.type === "progress") {
+          status(msg.message);
+          return;
+        }
+        if (msg.type === "error") {
+          $("send").disabled = !selectionCount;
+          status(msg.message, "err");
+          return;
+        }
+        if (msg.type !== "payload") return;
+
+        if (msg.stats)
+          $("stats").textContent =
+            "Слоёв: " + msg.stats.layers +
+            " · ассетов: " + msg.stats.assets +
+            (msg.stats.variables ? " · токенов: " + msg.stats.variables : "");
+        status("Кодирую ассеты…");
+        const svg = {};
+        const png = {};
+        for (const a of msg.assets) {
+          const bytes = a.bytes;
+          if (a.kind === "svg") {
+            svg[a.id] = sanitizeSvg(new TextDecoder().decode(bytes));
+          } else {
+            png[a.id] = "data:image/png;base64," + bytesToBase64(bytes);
+          }
+        }
+        const preview = msg.preview
+          ? "data:image/png;base64," + bytesToBase64(msg.preview)
+          : null;
+
+        const body = JSON.stringify({
+          fileName: msg.fileName,
+          node: msg.node,
+          assets: { svg, png },
+          preview,
+          variables: msg.variables || [],
+        });
+
+        const mb = (body.length / 1048576).toFixed(1);
+        $("stats").textContent += " · " + mb + " МБ";
+
+        const base = $("endpoint").value.replace(/\/+$/, "");
+        status("Отправляю в приложение…");
+        try {
+          const res = await fetch(base + "/api/plugin/ingest", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body,
+          });
+          if (res.ok) status("Отправлено ✓ — смотрите приложение.", "ok");
+          else if (res.status === 413)
+            status(
+              "Слишком большой блок (" + mb + " МБ, лимит 25). Выберите блок поменьше.",
+              "err",
+            );
+          else status("Ошибка приложения: HTTP " + res.status, "err");
+        } catch (e) {
+          status("Не достучался до приложения. Запущено ли оно?", "err");
+        } finally {
+          $("send").disabled = !selectionCount;
+        }
+      };
+    </script>
+  </body>
+</html>

@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Figma Copy — тест генерации кода</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font: 13px/1.5 -apple-system, Segoe UI, Roboto, sans-serif;
+        background: #0e0e12;
+        color: #e7e7ea;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+        padding: 12px 18px;
+        border-bottom: 1px solid #23232b;
+        position: sticky;
+        top: 0;
+        background: #0e0e12;
+        z-index: 5;
+      }
+      h1 { font-size: 14px; margin: 0 6px 0 0; font-weight: 600; }
+      .dot { width: 9px; height: 9px; border-radius: 50%; background: #555; }
+      .dot.on { background: #3ad07a; }
+      .dot.off { background: #d0453a; }
+      #status { color: #9a9aa2; }
+      .meta { margin-left: auto; color: #8a8a92; font-size: 12px; }
+      select, button {
+        font: inherit;
+        color: #e7e7ea;
+        background: #1a1a22;
+        border: 1px solid #2c2c37;
+        border-radius: 7px;
+        padding: 5px 9px;
+        cursor: pointer;
+      }
+      label.toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        color: #b7b7c0;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      button.copy:hover { border-color: #4a4aff; }
+      main { padding: 0; }
+      pre {
+        margin: 0;
+        padding: 18px;
+        min-height: calc(100vh - 58px);
+        overflow: auto;
+        font: 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: #cfd2da;
+        white-space: pre;
+        tab-size: 2;
+      }
+      .hint { color: #6a6a72; }
+      .err { color: #ff7a6e; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <span id="dot" class="dot"></span>
+      <h1>Figma Copy — код</h1>
+      <span id="status">подключение…</span>
+
+      <select id="lang" title="Целевой язык">
+        <option value="react">React + Tailwind</option>
+        <option value="html">HTML + Tailwind</option>
+        <option value="vue">Vue 3 SFC</option>
+        <option value="cssJsx">React + CSS-modules</option>
+        <option value="cssCss">CSS (к CSS-modules)</option>
+      </select>
+
+      <label class="toggle"><input type="checkbox" id="tokens" /> токены</label>
+      <label class="toggle"><input type="checkbox" id="semantic" checked /> семантика</label>
+      <button class="copy" id="copy">Копировать</button>
+
+      <span class="meta" id="meta"></span>
+    </header>
+
+    <main>
+      <pre id="out" class="hint">Запусти плагин в Figma и отправь выделение — здесь появится код.</pre>
+    </main>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const dot = $("dot"), status = $("status"), out = $("out");
+      let payload = null;       // last payload from the plugin
+      let result = null;        // last /api/convert response
+
+      function setConn(on) {
+        dot.className = "dot " + (on ? "on" : "off");
+        status.textContent = on
+          ? "подключено — жду данные из плагина"
+          : "нет связи с /api/plugin/stream";
+      }
+
+      function countNodes(n) {
+        let c = 1;
+        for (const ch of n.children || []) c += countNodes(ch);
+        return c;
+      }
+
+      function show() {
+        if (!result) return;
+        const lang = $("lang").value;
+        out.textContent = result[lang] || "// (пусто для этого языка)";
+        out.className = "";
+      }
+
+      async function convert() {
+        if (!payload || !payload.node) return;
+        out.className = "hint";
+        out.textContent = "Генерирую…";
+        try {
+          const res = await fetch("/api/convert", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              node: payload.node,
+              assets: payload.assets || {},
+              useTokens: $("tokens").checked,
+              semantic: $("semantic").checked,
+            }),
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+          result = data;
+          $("meta").textContent =
+            (payload.fileName || "—") +
+            " · " + (data.componentName || "") +
+            " · нод: " + countNodes(payload.node);
+          show();
+        } catch (e) {
+          result = null;
+          out.className = "err";
+          out.textContent = "Ошибка: " + e.message;
+        }
+      }
+
+      $("lang").onchange = show;
+      $("tokens").onchange = convert;
+      $("semantic").onchange = convert;
+      $("copy").onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(out.textContent);
+          $("copy").textContent = "Скопировано ✓";
+          setTimeout(() => ($("copy").textContent = "Копировать"), 1200);
+        } catch {}
+      };
+
+      const es = new EventSource("/api/plugin/stream");
+      es.onopen = () => setConn(true);
+      es.onerror = () => setConn(false);
+      es.onmessage = (e) => {
+        try {
+          payload = JSON.parse(e.data);
+          convert();
+        } catch (err) {
+          console.error("bad payload", err);
+        }
+      };
+    </script>
+  </body>
+</html>
