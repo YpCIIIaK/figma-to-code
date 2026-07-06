@@ -13,6 +13,7 @@ export const runtime = "nodejs";
  *   useTokens?: boolean,
  *   semantic?: boolean,
  *   inferLayout?: boolean,         // inferred auto-layout → flex (opt-in)
+ *   responsive?: boolean,          // fluid root: w-full + max-w (opt-in)
  *   mode?: "combine" | "separate",
  * }
  * Returns generated code for every target: { react, html, vue, cssJsx, cssCss }.
@@ -33,6 +34,7 @@ export async function POST(req: NextRequest) {
       useTokens: !!body.useTokens,
       semantic: body.semantic !== false,
       inferLayout: !!body.inferLayout,
+      responsive: !!body.responsive,
     };
 
     const converted =

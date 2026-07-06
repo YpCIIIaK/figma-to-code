@@ -41,6 +41,8 @@ export default function Home() {
   // Turn Figma's inferred auto-layout on free-form frames into flex (opt-in:
   // changes absolute-positioned output into flow layout, so off by default).
   const [inferLayout, setInferLayout] = useState(false);
+  // Fluid root (w-full + max-w) so the block adapts to narrow viewports (opt-in).
+  const [responsive, setResponsive] = useState(false);
   // Design-system variables from the plugin payload (color/primary/500, etc.).
   const [variables, setVariables] = useState<VarToken[]>([]);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -77,8 +79,8 @@ export default function Home() {
   // selection + toggle combination, so restoring them never shows stale code.
   const selectionKey = useMemo(() => {
     const ids = [...selectedIds].sort().join(",");
-    return `${fileKey ?? ""}|${ids}|${multiMode}|${useTokens ? 1 : 0}|${semantic ? 1 : 0}|${inferLayout ? 1 : 0}`;
-  }, [fileKey, selectedIds, multiMode, useTokens, semantic, inferLayout]);
+    return `${fileKey ?? ""}|${ids}|${multiMode}|${useTokens ? 1 : 0}|${semantic ? 1 : 0}|${inferLayout ? 1 : 0}|${responsive ? 1 : 0}`;
+  }, [fileKey, selectedIds, multiMode, useTokens, semantic, inferLayout, responsive]);
 
   // Resolve checked ids to actual nodes (tree is already loaded client-side).
   const selectedNodes = useMemo(() => {
@@ -90,10 +92,10 @@ export default function Home() {
 
   const converted = useMemo(() => {
     if (!selectedNodes.length) return null;
-    const opts = { absolutePositioning: true, useTokens, semantic, inferLayout, variables };
+    const opts = { absolutePositioning: true, useTokens, semantic, inferLayout, responsive, variables };
     if (selectedNodes.length === 1) return convertNode(selectedNodes[0], opts);
     return convertNodes(selectedNodes, multiMode, opts);
-  }, [selectedNodes, multiMode, useTokens, semantic, inferLayout, variables]);
+  }, [selectedNodes, multiMode, useTokens, semantic, inferLayout, responsive, variables]);
 
   // Node fed to the token extractor (synthetic group when multiple selected).
   const tokenNode = useMemo(() => {
@@ -745,6 +747,17 @@ export default function Home() {
                   }`}
                 >
                   Авто-flex
+                </button>
+                <button
+                  onClick={() => setResponsive((v) => !v)}
+                  title="Флюидный корень: w-full + max-w вместо фикс-ширины, чтобы блок адаптировался к узким экранам"
+                  className={`rounded border px-2 py-0.5 text-xs font-medium ${
+                    responsive
+                      ? "border-accent bg-accent/20 text-white"
+                      : "border-border text-foreground/50 hover:text-foreground"
+                  }`}
+                >
+                  Адаптив
                 </button>
               </>
             )}

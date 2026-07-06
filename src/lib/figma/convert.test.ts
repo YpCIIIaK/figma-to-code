@@ -31,6 +31,46 @@ describe("converter: visual fidelity", () => {
     expect(convertNode(n).html).toContain("linear-gradient(90deg");
   });
 
+  it("positions a radial gradient from its handles", () => {
+    const n = frame({
+      fills: [
+        {
+          type: "GRADIENT_RADIAL",
+          gradientHandlePositions: [
+            { x: 0.5, y: 0.5 },
+            { x: 1, y: 0.5 },
+            { x: 0.5, y: 1 },
+          ],
+          gradientStops: [
+            { position: 0, color: { r: 1, g: 1, b: 1, a: 1 } },
+            { position: 1, color: { r: 0, g: 0, b: 0, a: 1 } },
+          ],
+        },
+      ],
+    });
+    expect(convertNode(n).html).toContain("radial-gradient(ellipse 50% 50% at 50% 50%");
+  });
+
+  it("stacks a gradient over a solid fill as layered backgrounds", () => {
+    const n = frame({
+      fills: [
+        { type: "SOLID", color: { r: 0, g: 0, b: 0, a: 1 } },
+        {
+          type: "GRADIENT_LINEAR",
+          gradientAngle: 0,
+          gradientStops: [
+            { position: 0, color: { r: 1, g: 0, b: 0, a: 0.5 } },
+            { position: 1, color: { r: 0, g: 0, b: 1, a: 0.5 } },
+          ],
+        },
+      ],
+    });
+    const { html } = convertNode(n);
+    // gradient (top) listed before the flattened solid (bottom)
+    expect(html).toContain("linear-gradient(0deg,");
+    expect(html).toMatch(/,\s*linear-gradient\(#000000,#000000\)/);
+  });
+
   it("emits rotation, layer blur and backdrop blur", () => {
     const n = frame({
       rotation: 15,
@@ -621,6 +661,20 @@ describe("converter: FigmaToCode-inspired features", () => {
     t.absoluteBoundingBox = box(650, 90);
     t.textAutoResize = "HEIGHT";
     expect(convertNode(t).code).toContain("w-[650px]");
+  });
+
+  it("makes the root fluid in responsive mode", () => {
+    const n = frame({ absoluteBoundingBox: box(1360, 554) });
+    const { code } = convertNode(n, { absolutePositioning: true, responsive: true });
+    expect(code).toContain("w-full");
+    expect(code).toContain("max-w-[1360px]");
+    expect(code).toContain("mx-auto");
+    expect(code).not.toMatch(/[" ]w-\[1360px\]/);
+  });
+
+  it("keeps the root's fixed width without responsive mode", () => {
+    const n = frame({ absoluteBoundingBox: box(1360, 554) });
+    expect(convertNode(n).code).toContain("w-[1360px]");
   });
 
   it("leaves content-hugging text width-less", () => {

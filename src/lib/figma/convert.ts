@@ -65,6 +65,8 @@ export interface ConvertOptions {
   semantic?: boolean;
   /** turn Figma's inferred auto-layout on free-form frames into flex (opt-in) */
   inferLayout?: boolean;
+  /** make the root block fluid: w-full + max-w instead of a hard pixel width */
+  responsive?: boolean;
   /** design-system variables (from the Figma plugin) → real token names */
   variables?: VarToken[];
   /** internal: value→token-name maps, built once per conversion */
@@ -380,7 +382,20 @@ function gradientCss(p: FigmaPaint): string | null {
   const stops = p.gradientStops
     .map((s) => `${colorToHex(s.color)} ${r(s.position * 100)}%`)
     .join(", ");
-  if (p.type === "GRADIENT_RADIAL") return `radial-gradient(circle, ${stops})`;
+  if (p.type === "GRADIENT_RADIAL") {
+    // Position/size the ellipse from Figma's handles: [0] centre, [1] end of the
+    // horizontal radius, [2] end of the vertical radius (all normalised 0–1 to
+    // the box). Without handles fall back to a centred circle.
+    const h = p.gradientHandlePositions;
+    if (h && h.length >= 3) {
+      const cx = r(h[0].x * 100);
+      const cy = r(h[0].y * 100);
+      const rx = r(Math.hypot(h[1].x - h[0].x, h[1].y - h[0].y) * 100);
+      const ry = r(Math.hypot(h[2].x - h[0].x, h[2].y - h[0].y) * 100);
+      return `radial-gradient(ellipse ${rx}% ${ry}% at ${cx}% ${cy}%, ${stops})`;
+    }
+    return `radial-gradient(circle, ${stops})`;
+  }
   // Prefer the real gradient angle (plugin computes it from the handle
   // positions); fall back to top-to-bottom for REST payloads that lack it.
   const angle = p.gradientAngle != null ? r(p.gradientAngle) : 180;
@@ -713,18 +728,25 @@ function nodeToIR(
   // ---- Fills / background ----
   if (!isText) {
     const fills = node.fills ?? [];
-    const grad = fills.find(
+    const grads = fills.filter(
       (f) => f.visible !== false && f.type.startsWith("GRADIENT"),
     );
     const img = fills.find((f) => f.visible !== false && f.type === "IMAGE");
     const solidPaint = firstSolidPaint(fills);
-    if (grad) {
+    if (grads.length) {
       // Angular/diamond gradients have no CSS equivalent — approximated as a
       // linear gradient, so flag it as lossy.
-      if (grad.type === "GRADIENT_ANGULAR" || grad.type === "GRADIENT_DIAMOND")
-        warn(opts, node, `${grad.type} approximated as a linear gradient`);
-      const g = gradientCss(grad);
-      if (g) el.style["background"] = g;
+      for (const grad of grads)
+        if (grad.type === "GRADIENT_ANGULAR" || grad.type === "GRADIENT_DIAMOND")
+          warn(opts, node, `${grad.type} approximated as a linear gradient`);
+      // Stack every gradient into one `background`. CSS paints the first layer
+      // on top; Figma's fills[0] is the bottom layer — so reverse. A solid fill
+      // beneath the gradients becomes the last (bottom) layer, expressed as a
+      // flat gradient so it can share the shorthand.
+      const layers = [...grads].reverse().map(gradientCss).filter(Boolean) as string[];
+      if (solidPaint)
+        layers.push(`linear-gradient(${solidPaint.value},${solidPaint.value})`);
+      if (layers.length) el.style["background"] = layers.join(", ");
     } else if (img) {
       // The plugin exports the container's photo fill as a real background
       // image (children hidden during export); inject it here as a bg-image.
@@ -906,6 +928,12 @@ function nodeToIR(
       node.textAutoResize === "NONE" || node.textAutoResize === "HEIGHT";
     if (fixedWidthText && geo && !fillW && !constraintNoW)
       cls.push(`w-[${r(geo.width)}px]`);
+    // Content-hugging text (autoResize WIDTH_AND_HEIGHT) sizes to its content and
+    // never wraps in Figma. Without a width the browser wraps it to whatever room
+    // is left — which is tiny when the node is centered (left-1/2 -translate-x-1/2)
+    // or otherwise pinned mid-parent. whitespace-nowrap reproduces the hug.
+    else if (node.textAutoResize === "WIDTH_AND_HEIGHT")
+      cls.push("whitespace-nowrap");
     // Bound to a component TEXT property → render `{propName}` in the JSX.
     if (node.textProp) {
       const pn = propIdent(node.textProp);
@@ -977,6 +1005,18 @@ function nodeToIR(
         if (label && !/^(frame|group|rectangle|vector)\b/i.test(label))
           el.attrs = { "aria-label": label, ...el.attrs };
       }
+    }
+  }
+
+  // ---- Responsive root: a hard-pixel canvas overflows narrow viewports.
+  // Turn the top-level block's fixed width into a fluid one (w-full capped by
+  // max-w) that centres itself, so the component adapts down to mobile. Only the
+  // root — inner absolute children still need their pixel geometry.
+  if (!parent && opts.responsive) {
+    const wi = cls.findIndex((c) => /^w-\[\d+px\]$/.test(c));
+    if (wi >= 0) {
+      const w = /^w-\[(\d+)px\]$/.exec(cls[wi])![1];
+      cls.splice(wi, 1, "w-full", `max-w-[${w}px]`, "mx-auto");
     }
   }
 
