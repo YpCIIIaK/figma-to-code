@@ -4,14 +4,21 @@
   "api": "1.0.0",
   "main": "code.js",
   "ui": "ui.html",
-  "editorType": ["figma"],
+  "editorType": [
+    "figma"
+  ],
   "networkAccess": {
     "allowedDomains": [
       "http://localhost:3000",
+      "http://localhost:3001",
+      "http://localhost:3002",
+      "http://localhost:3003",
+      "http://localhost:3004",
+      "http://localhost:3005",
       "https://cdn.tailwindcss.com",
       "https://fonts.googleapis.com",
       "https://fonts.gstatic.com"
     ],
-    "reasoning": "Sends the selected design to the Figma Copy app for code generation and renders the generated markup in the plugin preview."
+    "reasoning": "Renders the generated markup in the plugin preview (Tailwind + Google Fonts). Code generation runs inside the plugin; the localhost ports are only for the optional companion app."
   }
 }
