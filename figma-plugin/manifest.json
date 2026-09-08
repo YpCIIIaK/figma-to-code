@@ -6,7 +6,12 @@
   "ui": "ui.html",
   "editorType": ["figma"],
   "networkAccess": {
-    "allowedDomains": ["http://localhost:3000"],
-    "reasoning": "Sends the selected design to the local Figma Copy app for code generation."
+    "allowedDomains": [
+      "http://localhost:3000",
+      "https://cdn.tailwindcss.com",
+      "https://fonts.googleapis.com",
+      "https://fonts.gstatic.com"
+    ],
+    "reasoning": "Sends the selected design to the Figma Copy app for code generation and renders the generated markup in the plugin preview."
   }
 }

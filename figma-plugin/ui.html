@@ -3,92 +3,617 @@
   <head>
     <meta charset="utf-8" />
     <style>
+      * { box-sizing: border-box; }
+      html, body { height: 100%; }
       body {
         font: 12px -apple-system, Segoe UI, sans-serif;
         margin: 0;
-        padding: 14px;
         color: #1a1a1a;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
       }
-      h1 { font-size: 13px; margin: 0 0 10px; }
-      label { display: block; font-size: 11px; color: #666; margin: 10px 0 4px; }
-      input {
-        width: 100%;
-        box-sizing: border-box;
-        padding: 6px 8px;
+      .bar {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 8px 10px;
+        border-bottom: 1px solid #e6e6e6;
+        flex: none;
+      }
+      .bar.wrap { flex-wrap: wrap; }
+      .grow { flex: 1; }
+      button {
+        padding: 6px 10px;
+        border: 1px solid #ddd;
+        border-radius: 6px;
+        background: #fff;
+        color: #1a1a1a;
+        font: inherit;
+        cursor: pointer;
+      }
+      button:hover:not(:disabled) { background: #f4f4f6; }
+      button.primary {
+        background: #7c6cff;
+        border-color: #7c6cff;
+        color: #fff;
+        font-weight: 600;
+      }
+      button.primary:hover:not(:disabled) { background: #6b5aef; }
+      button:disabled { opacity: 0.45; cursor: default; }
+      .tab { border: 0; border-radius: 6px; padding: 5px 9px; color: #666; }
+      .tab.active { background: #eceafd; color: #4b3ce0; font-weight: 600; }
+      input[type="text"] {
+        padding: 5px 8px;
         border: 1px solid #ddd;
         border-radius: 6px;
         font: inherit;
+        min-width: 0;
       }
-      button {
-        width: 100%;
-        margin-top: 12px;
-        padding: 9px;
-        border: 0;
-        border-radius: 6px;
-        background: #7c6cff;
-        color: #fff;
-        font-weight: 600;
-        cursor: pointer;
+      label.chk { display: flex; align-items: center; gap: 4px; color: #555; cursor: pointer; }
+      main { flex: 1; min-height: 0; position: relative; }
+      .pane { position: absolute; inset: 0; display: none; flex-direction: column; }
+      .pane.active { display: flex; }
+      pre {
+        margin: 0;
+        flex: 1;
+        overflow: auto;
+        padding: 10px 12px;
+        font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+        white-space: pre;
+        background: #fbfbfd;
       }
-      button:disabled { opacity: 0.5; cursor: default; }
-      #status { margin-top: 10px; font-size: 11px; min-height: 16px; }
+      iframe { flex: 1; width: 100%; border: 0; background: #fff; }
+      #figmaImg { flex: 1; min-height: 0; object-fit: contain; padding: 10px; background: #f4f4f6; }
+      #status { padding: 6px 10px; font-size: 11px; border-top: 1px solid #e6e6e6; color: #666; flex: none; }
       .ok { color: #1a8a4a; }
       .err { color: #c0392b; }
-      .muted { color: #888; }
+      .empty {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #999;
+        text-align: center;
+        padding: 20px;
+      }
+      #grip {
+        position: fixed;
+        right: 0;
+        bottom: 0;
+        width: 16px;
+        height: 16px;
+        cursor: nwse-resize;
+        background: linear-gradient(135deg, transparent 50%, #c9c9d1 50%);
+        z-index: 10;
+      }
+      .list { flex: 1; overflow: auto; }
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 10px;
+        border-bottom: 1px solid #f0f0f2;
+      }
+      .row .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .row .meta { color: #999; font-size: 11px; flex: none; }
+      .swatch { width: 18px; height: 18px; border: 1px solid #ddd; border-radius: 4px; padding: 0; }
     </style>
   </head>
   <body>
-    <h1>Отправить выбранное в Figma Copy</h1>
-    <label>Адрес приложения</label>
-    <input id="endpoint" value="http://localhost:3000" />
-    <button id="send" disabled>Отправить выбранное</button>
-    <div id="status" class="muted">Выберите блок в Figma и нажмите кнопку.</div>
-    <div id="stats" class="muted" style="margin-top: 6px; font-size: 11px;"></div>
+    <div class="bar">
+      <button id="run" class="primary" disabled>Сгенерировать</button>
+      <button id="viewCode" class="tab active">Код</button>
+      <button id="viewPreview" class="tab">Превью</button>
+      <button id="viewFigma" class="tab">Figma</button>
+      <button id="viewAssets" class="tab">Ассеты</button>
+      <button id="viewFonts" class="tab">Шрифты</button>
+      <button id="viewSettings" class="tab">⚙</button>
+      <span class="grow"></span>
+      <button id="copy" disabled>Копировать</button>
+    </div>
+
+    <main>
+      <!-- Код -->
+      <div class="pane active" id="paneCode">
+        <div class="bar">
+          <button class="tab active" data-target="react">React</button>
+          <button class="tab" data-target="html">HTML</button>
+          <button class="tab" data-target="vue">Vue</button>
+          <button class="tab" data-target="cssJsx">CSS-модуль</button>
+          <button class="tab" data-target="cssCss">.module.css</button>
+        </div>
+        <pre id="code"></pre>
+        <div class="empty" id="codeEmpty">Выберите блок в Figma и нажмите «Сгенерировать».</div>
+      </div>
+
+      <!-- Превью -->
+      <div class="pane" id="panePreview">
+        <div class="bar">
+          <span style="color: #666">Фон</span>
+          <button class="swatch" data-bg="#ffffff" style="background: #fff"></button>
+          <button class="swatch" data-bg="#18181b" style="background: #18181b"></button>
+          <button class="swatch" data-bg="checker" style="background: repeating-conic-gradient(#d7d7dd 0% 25%, #f2f2f5 0% 50%) 50% / 10px 10px"></button>
+        </div>
+        <iframe id="frame" sandbox="allow-scripts"></iframe>
+      </div>
+
+      <!-- Figma-скриншот -->
+      <div class="pane" id="paneFigma">
+        <img id="figmaImg" alt="Figma превью" />
+      </div>
+
+      <!-- Ассеты: код картинок вынесен из основного кода, копируется отдельно -->
+      <div class="pane" id="paneAssets">
+        <div class="bar">
+          <span style="color: #666">Файлы, на которые ссылается код</span>
+          <span class="grow"></span>
+          <button id="copyAllSvg">Копировать все SVG</button>
+        </div>
+        <div class="list" id="assetList"></div>
+      </div>
+
+      <!-- Шрифты (общие с веб-приложением) -->
+      <div class="pane" id="paneFonts">
+        <div class="bar">
+          <button id="addFont">Загрузить шрифты…</button>
+          <input type="file" id="fontInput" accept=".woff2,.woff,.ttf,.otf" multiple hidden />
+          <span class="grow"></span>
+          <button id="reloadFonts">Обновить</button>
+        </div>
+        <div class="list" id="fontList"></div>
+      </div>
+
+      <!-- Настройки -->
+      <div class="pane" id="paneSettings">
+        <div class="bar wrap">
+          <label class="chk"><input type="checkbox" id="optTokens" /> Токены</label>
+          <label class="chk"><input type="checkbox" id="optSemantic" checked /> Семантика</label>
+          <label class="chk"><input type="checkbox" id="optLayout" /> Авто-layout → flex</label>
+          <label class="chk"><input type="checkbox" id="optResponsive" /> Адаптив</label>
+          <label class="chk"><input type="checkbox" id="optNames" /> Имена слоёв</label>
+          <label class="chk"><input type="checkbox" id="optPaths" checked /> Ассеты файлами</label>
+        </div>
+        <div class="bar">
+          <span style="color: #666">Адрес приложения</span>
+          <input type="text" id="endpoint" class="grow" value="http://localhost:3000" />
+        </div>
+        <div class="bar">
+          <button id="send">Открыть в приложении</button>
+          <span style="color: #888">— отправить выбранное в веб-интерфейс</span>
+        </div>
+        <div class="bar">
+          <button id="dumpTree">Скопировать дерево слоёв (JSON)</button>
+          <span style="color: #888">— для отладки: что плагин реально видит</span>
+        </div>
+        <div class="empty" id="stats"></div>
+      </div>
+    </main>
+
+    <div id="status">Выберите блок в Figma.</div>
+    <div id="grip" title="Потяните, чтобы изменить размер"></div>
 
     <script>
       const $ = (id) => document.getElementById(id);
+      const post = (m) => parent.postMessage({ pluginMessage: m }, "*");
       const status = (msg, cls) => {
         $("status").textContent = msg;
-        $("status").className = cls || "muted";
+        $("status").className = cls || "";
       };
 
+      // ---- window resize (Figma has no native handle; we drive figma.ui.resize)
+      (function () {
+        const grip = $("grip");
+        let dragging = false;
+        grip.addEventListener("pointerdown", (e) => {
+          dragging = true;
+          grip.setPointerCapture(e.pointerId);
+          e.preventDefault();
+        });
+        grip.addEventListener("pointermove", (e) => {
+          if (!dragging) return;
+          // clientX/Y are relative to the plugin iframe, which *is* the window.
+          post({ type: "resize", width: e.clientX + 8, height: e.clientY + 8 });
+        });
+        const stop = () => { dragging = false; };
+        grip.addEventListener("pointerup", stop);
+        grip.addEventListener("pointercancel", stop);
+      })();
+
+      // ---- panes
+      const PANES = {
+        code: "paneCode", preview: "panePreview", figma: "paneFigma",
+        assets: "paneAssets", fonts: "paneFonts", settings: "paneSettings",
+      };
+      const VIEW_BTN = {
+        code: "viewCode", preview: "viewPreview", figma: "viewFigma",
+        assets: "viewAssets", fonts: "viewFonts", settings: "viewSettings",
+      };
+      let pane = "code";
+      function showPane(name) {
+        pane = name;
+        for (const k in PANES) {
+          $(PANES[k]).classList.toggle("active", k === name);
+          $(VIEW_BTN[k]).classList.toggle("active", k === name);
+        }
+        $("copy").disabled = name !== "code" || !generated;
+        if (name === "fonts" && !fontsLoaded) {
+          fontsLoaded = true;
+          loadFonts();
+        }
+      }
+      let fontsLoaded = false;
+      for (const k in VIEW_BTN) $(VIEW_BTN[k]).onclick = ((n) => () => showPane(n))(k);
+
+      // ---- state
+      let selectionCount = 0;
+      let generated = null; // last /api/convert response
+      let lastPayload = null; // last exported payload (re-convert without re-export)
+      let target = "react";
+      let bg = "#ffffff";
+      let fontCss = null; // cached @font-face block for the preview
+
+      const options = () => ({
+        useTokens: $("optTokens").checked,
+        semantic: $("optSemantic").checked,
+        inferLayout: $("optLayout").checked,
+        responsive: $("optResponsive").checked,
+        layerNames: $("optNames").checked,
+        // Off = bytes inlined (data URI / <svg>); on = src="assets/name.svg".
+        assetMode: $("optPaths").checked ? "paths" : "inline",
+      });
+      for (const id of ["optTokens", "optSemantic", "optLayout", "optResponsive", "optNames", "optPaths"]) {
+        $(id).onchange = () => {
+          post({ type: "saveOptions", options: options() });
+          // Re-convert from the payload we already have — no re-export needed.
+          if (lastPayload) convert();
+        };
+      }
+
+      // ---- code target tabs
+      for (const b of document.querySelectorAll("[data-target]")) {
+        b.onclick = () => {
+          for (const o of document.querySelectorAll("[data-target]")) o.classList.remove("active");
+          b.classList.add("active");
+          target = b.dataset.target;
+          renderCode();
+        };
+      }
+      function renderCode() {
+        const text = generated ? generated[target] || "" : "";
+        $("code").textContent = text;
+        $("code").style.display = text ? "" : "none";
+        $("codeEmpty").style.display = text ? "none" : "";
+        $("copy").disabled = pane !== "code" || !text;
+      }
+      async function copyText(text, what) {
+        try {
+          await navigator.clipboard.writeText(text);
+          status((what || "Скопировано") + " ✓", "ok");
+          return;
+        } catch (e) {
+          // The async clipboard is blocked in some Figma builds — fall back to a
+          // hidden textarea + execCommand, which works inside the plugin iframe.
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          document.body.appendChild(ta);
+          ta.select();
+          const ok = document.execCommand("copy");
+          ta.remove();
+          status(ok ? (what || "Скопировано") + " ✓" : "Не удалось скопировать", ok ? "ok" : "err");
+        }
+      }
+
+      $("copy").onclick = async () => {
+        try {
+          await navigator.clipboard.writeText($("code").textContent);
+          status("Скопировано ✓", "ok");
+        } catch (e) {
+          // The async clipboard is blocked in some Figma builds — fall back to a
+          // selection copy, which works inside the plugin iframe.
+          const r = document.createRange();
+          r.selectNodeContents($("code"));
+          const s = getSelection();
+          s.removeAllRanges();
+          s.addRange(r);
+          document.execCommand("copy");
+          status("Скопировано ✓", "ok");
+        }
+      };
+
+      // ---- preview
+      for (const b of document.querySelectorAll("[data-bg]")) {
+        b.onclick = () => { bg = b.dataset.bg; renderPreview(); };
+      }
+      const CHECKER = "repeating-conic-gradient(#d7d7dd 0% 25%, #f2f2f5 0% 50%) 50% / 24px 24px";
+      /** Uploaded fonts as @font-face rules, so the preview isn't a fallback face. */
+      async function ensureFontCss() {
+        if (fontCss !== null) return fontCss;
+        try {
+          const res = await fetch(base() + "/api/fonts?css=1");
+          fontCss = res.ok ? (await res.json()).css || "" : "";
+        } catch (e) {
+          fontCss = "";
+        }
+        return fontCss;
+      }
+
+      async function renderPreview() {
+        if (!generated) { $("frame").srcdoc = ""; return; }
+        const faceCss = await ensureFontCss();
+        const t = generated.previewTheme;
+        const hasTheme = t && (Object.keys(t.colors || {}).length || Object.keys(t.fontFamily || {}).length);
+        const config = hasTheme
+          ? "<scr" + "ipt>tailwind.config={theme:{extend:{colors:" + JSON.stringify(t.colors || {}) +
+            ",fontFamily:" + JSON.stringify(t.fontFamily || {}) +
+            ",spacing:" + JSON.stringify(t.spacing || {}) +
+            ",borderRadius:" + JSON.stringify(t.borderRadius || {}) +
+            ",fontSize:" + JSON.stringify(t.fontSize || {}) + "}}}</scr" + "ipt>"
+          : "";
+        const background = bg === "checker" ? CHECKER : bg;
+        // The generated HTML keeps assets as inline <svg> / data-URI <img>, so the
+        // preview needs no network beyond the Tailwind CDN.
+        $("frame").srcdoc =
+          '<!doctype html><html><head><meta charset="utf-8">' +
+          '<scr' + 'ipt src="https://cdn.tailwindcss.com"></scr' + 'ipt>' + config +
+          (faceCss ? "<style>" + faceCss + "</style>" : "") +
+          "<style>body{margin:0;display:flex;align-items:flex-start;justify-content:center;padding:24px;background:" +
+          background + ";}</style></head><body>" +
+          (generated.previewHtml || generated.html || "") + "</body></html>";
+      }
+
+      // ---- assets
+      // The generated code references files (assets/name.svg); the bytes live
+      // here so a chart or icon can be copied out one at a time.
+      function assetMarkup(a) {
+        const svg = (lastPayload && lastPayload.assets.svg) || {};
+        const png = (lastPayload && lastPayload.assets.png) || {};
+        return a.kind === "svg" ? svg[a.id] || "" : png[a.id] || "";
+      }
+      function renderAssets() {
+        const list = $("assetList");
+        list.textContent = "";
+        const files = (generated && generated.assetFiles) || [];
+        if (!files.length) {
+          const d = document.createElement("div");
+          d.className = "empty";
+          d.textContent = generated
+            ? "В этом блоке нет отдельных картинок (или включён режим «встроенные»)."
+            : "Сначала нажмите «Сгенерировать».";
+          list.appendChild(d);
+          return;
+        }
+        for (const a of files) {
+          const markup = assetMarkup(a);
+          const row = document.createElement("div");
+          row.className = "row";
+          const nm = document.createElement("span");
+          nm.className = "nm";
+          nm.textContent = a.path;
+          const meta = document.createElement("span");
+          meta.className = "meta";
+          meta.textContent = markup
+            ? (markup.length / 1024).toFixed(1) + " КБ"
+            : "нет данных";
+          const btn = document.createElement("button");
+          // A raster PNG is a data URI, not markup — say what the button gives.
+          const isMarkup = markup.slice(0, 1) === "<";
+          btn.textContent = isMarkup ? "Копировать SVG" : "Копировать data URI";
+          btn.disabled = !markup;
+          btn.onclick = () => copyText(markup, a.path);
+          row.appendChild(nm);
+          row.appendChild(meta);
+          row.appendChild(btn);
+          list.appendChild(row);
+        }
+      }
+      $("copyAllSvg").onclick = () => {
+        const files = (generated && generated.assetFiles) || [];
+        const parts = [];
+        for (const a of files) {
+          const m = assetMarkup(a);
+          if (m.slice(0, 1) === "<") parts.push("/* " + a.path + " */\n" + m);
+        }
+        if (!parts.length) return status("Нечего копировать — SVG в этом блоке нет.", "err");
+        copyText(parts.join("\n\n"), "SVG (" + parts.length + " шт.)");
+      };
+
+      // ---- fonts (shared with the web app through /api/fonts)
+      async function loadFonts() {
+        const list = $("fontList");
+        list.textContent = "Загружаю…";
+        try {
+          const res = await fetch(base() + "/api/fonts");
+          const data = await res.json();
+          list.textContent = "";
+          const faces = data.faces || [];
+          if (!faces.length) {
+            const d = document.createElement("div");
+            d.className = "empty";
+            d.textContent = "Шрифтов пока нет. Загрузите .woff2 / .woff / .ttf / .otf.";
+            list.appendChild(d);
+            return;
+          }
+          for (const f of faces) {
+            const row = document.createElement("div");
+            row.className = "row";
+            const nm = document.createElement("span");
+            nm.className = "nm";
+            nm.textContent = f.family + " · " + f.weight + (f.style === "italic" ? " italic" : "");
+            const meta = document.createElement("span");
+            meta.className = "meta";
+            meta.textContent = f.fileName + " · " + Math.round((f.size || 0) / 1024) + " КБ";
+            row.appendChild(nm);
+            row.appendChild(meta);
+            list.appendChild(row);
+          }
+        } catch (e) {
+          list.textContent = "";
+          const d = document.createElement("div");
+          d.className = "empty err";
+          d.textContent = "Не достучался до приложения (" + base() + ").";
+          list.appendChild(d);
+        }
+      }
+      $("reloadFonts").onclick = loadFonts;
+      $("addFont").onclick = () => $("fontInput").click();
+      $("fontInput").onchange = async () => {
+        const files = Array.from($("fontInput").files || []);
+        if (!files.length) return;
+        status("Загружаю шрифты…");
+        const add = [];
+        for (const file of files) {
+          const bytes = new Uint8Array(await file.arrayBuffer());
+          add.push({ fileName: file.name, base64: bytesToBase64(bytes) });
+        }
+        try {
+          const res = await fetch(base() + "/api/fonts", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ add }),
+          });
+          const data = await res.json();
+          if (!res.ok) return status("Ошибка: " + (data.error || "HTTP " + res.status), "err");
+          const skipped = (data.skipped || []).length;
+          status(
+            "Шрифты сохранены ✓" + (skipped ? " · пропущено (не шрифт): " + skipped : ""),
+            "ok",
+          );
+          fontCss = null; // force a refresh before the next preview render
+          loadFonts();
+          renderPreview();
+        } catch (e) {
+          status("Не достучался до приложения. Оно запущено?", "err");
+        } finally {
+          $("fontInput").value = "";
+        }
+      };
+
+      // ---- actions
+      $("run").onclick = () => {
+        if (!selectionCount) return;
+        $("run").disabled = true;
+        lastPayload = null;
+        status("Читаю выбранное…");
+        post({ type: "send" });
+      };
+      let wantIngest = false;
+      $("send").onclick = () => {
+        if (!selectionCount && !lastPayload) return;
+        wantIngest = true;
+        if (lastPayload) return ingest();
+        $("run").disabled = true;
+        status("Читаю выбранное…");
+        post({ type: "send" });
+      };
+
+      // Debug aid: hand over the tree the plugin actually serialized. The REST
+      // API can return a degraded view of a frame (Draw shapes, newer node
+      // types), so comparing the two is the only way to tell a converter bug
+      // from missing input.
+      $("dumpTree").onclick = () => {
+        if (!lastPayload || !lastPayload.node) {
+          status("Сначала нажмите «Сгенерировать»", "err");
+          return;
+        }
+        let count = 0;
+        (function walk(n) {
+          count++;
+          for (const c of n.children || []) walk(c);
+        })(lastPayload.node);
+        copyText(
+          JSON.stringify({ node: lastPayload.node, variables: lastPayload.variables }, null, 1),
+          "дерево слоёв (" + count + " нод)",
+        );
+      };
+
+      let saveTimer;
+      $("endpoint").oninput = () => {
+        clearTimeout(saveTimer);
+        saveTimer = setTimeout(() => post({ type: "saveEndpoint", endpoint: $("endpoint").value }), 400);
+      };
+      const base = () => $("endpoint").value.replace(/\/+$/, "");
+
+      async function convert() {
+        if (!lastPayload) return;
+        status("Генерирую код…");
+        try {
+          const res = await fetch(base() + "/api/convert", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(Object.assign({
+              node: lastPayload.node,
+              assets: lastPayload.assets,
+              variables: lastPayload.variables,
+            }, options())),
+          });
+          if (!res.ok) {
+            const e = await res.json().catch(() => ({}));
+            status("Ошибка конвертации: " + (e.error || "HTTP " + res.status), "err");
+            return;
+          }
+          generated = await res.json();
+          renderCode();
+          renderAssets();
+          renderPreview();
+          const warn = (generated.warnings || []).length;
+          const files = (generated.assetFiles || []).length;
+          status(
+            "Готово ✓" +
+              (files ? " · ассетов файлами: " + files + " (экспортируйте их из Figma)" : "") +
+              (warn ? " · замечаний: " + warn : ""),
+            "ok",
+          );
+          if (pane === "settings") showPane("code");
+        } catch (e) {
+          status("Не достучался до приложения (" + base() + "). Оно запущено?", "err");
+        } finally {
+          $("run").disabled = !selectionCount;
+        }
+      }
+
+      async function ingest() {
+        wantIngest = false;
+        status("Отправляю в приложение…");
+        const body = JSON.stringify(lastPayload);
+        const mb = (body.length / 1048576).toFixed(1);
+        try {
+          const res = await fetch(base() + "/api/plugin/ingest", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body,
+          });
+          if (res.ok) status("Отправлено ✓ — смотрите приложение.", "ok");
+          else if (res.status === 413)
+            status("Слишком большой блок (" + mb + " МБ, лимит 25). Выберите блок поменьше.", "err");
+          else status("Ошибка приложения: HTTP " + res.status, "err");
+        } catch (e) {
+          status("Не достучался до приложения. Запущено ли оно?", "err");
+        } finally {
+          $("run").disabled = !selectionCount;
+        }
+      }
+
+      // ---- asset encoding
+      // Strip the size attributes from the root <svg> tag ONLY. Figma's exports
+      // carry inner <mask>/<rect> elements sized by those very attributes, and
+      // clearing them collapses the mask to zero area — the drawing vanishes.
       function sanitizeSvg(raw) {
         return raw
           .replace(/<\?xml[^>]*\?>/i, "")
           .replace(/<!--[\s\S]*?-->/g, "")
-          .replace(/\s(width|height)="[^"]*"/gi, "")
+          .replace(/<svg\b[^>]*>/i, function (tag) {
+            return tag.replace(/\s(width|height)="[^"]*"/gi, "");
+          })
           .trim();
       }
-
       function bytesToBase64(bytes) {
         let bin = "";
         const chunk = 0x8000;
-        for (let i = 0; i < bytes.length; i += chunk) {
+        for (let i = 0; i < bytes.length; i += chunk)
           bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
-        }
         return btoa(bin);
       }
-
-      let selectionCount = 0;
-
-      $("send").onclick = () => {
-        if (!selectionCount) return;
-        $("send").disabled = true;
-        status("Готовлю выбранное…");
-        parent.postMessage({ pluginMessage: { type: "send" } }, "*");
-      };
-
-      // Persist the app address as you type it (debounced).
-      let saveTimer;
-      $("endpoint").oninput = () => {
-        clearTimeout(saveTimer);
-        saveTimer = setTimeout(() => {
-          parent.postMessage(
-            { pluginMessage: { type: "saveEndpoint", endpoint: $("endpoint").value } },
-            "*",
-          );
-        }, 400);
-      };
 
       onmessage = async (event) => {
         const msg = event.data.pluginMessage;
@@ -98,79 +623,62 @@
           if (msg.endpoint) $("endpoint").value = msg.endpoint;
           return;
         }
+        if (msg.type === "options") {
+          const o = msg.options || {};
+          $("optTokens").checked = !!o.useTokens;
+          $("optSemantic").checked = o.semantic !== false;
+          $("optLayout").checked = !!o.inferLayout;
+          $("optResponsive").checked = !!o.responsive;
+          $("optNames").checked = !!o.layerNames;
+          $("optPaths").checked = o.assetMode !== "inline";
+          return;
+        }
         if (msg.type === "selection") {
           selectionCount = msg.count;
-          $("send").disabled = !selectionCount;
-          if (!document.querySelector("#status").classList.contains("err"))
-            status(
-              selectionCount
-                ? "Выбрано блоков: " + selectionCount + " — можно отправлять."
-                : "Выберите блок в Figma.",
-            );
+          $("run").disabled = !selectionCount;
+          if (!$("status").classList.contains("err"))
+            status(selectionCount ? "Выбрано блоков: " + selectionCount : "Выберите блок в Figma.");
           return;
         }
-        if (msg.type === "progress") {
-          status(msg.message);
-          return;
-        }
+        if (msg.type === "progress") { status(msg.message); return; }
         if (msg.type === "error") {
-          $("send").disabled = !selectionCount;
+          $("run").disabled = !selectionCount;
           status(msg.message, "err");
           return;
         }
         if (msg.type !== "payload") return;
 
-        if (msg.stats)
-          $("stats").textContent =
-            "Слоёв: " + msg.stats.layers +
-            " · ассетов: " + msg.stats.assets +
-            (msg.stats.variables ? " · токенов: " + msg.stats.variables : "");
         status("Кодирую ассеты…");
         const svg = {};
         const png = {};
         for (const a of msg.assets) {
-          const bytes = a.bytes;
           if (a.kind === "svg") {
-            svg[a.id] = sanitizeSvg(new TextDecoder().decode(bytes));
+            // Rasterized fallback: the app accepts a ready data URI here.
+            svg[a.id] = a.raster
+              ? "data:image/png;base64," + bytesToBase64(a.bytes)
+              : sanitizeSvg(new TextDecoder().decode(a.bytes));
           } else {
-            png[a.id] = "data:image/png;base64," + bytesToBase64(bytes);
+            png[a.id] = "data:image/png;base64," + bytesToBase64(a.bytes);
           }
         }
-        const preview = msg.preview
-          ? "data:image/png;base64," + bytesToBase64(msg.preview)
-          : null;
+        const preview = msg.preview ? "data:image/png;base64," + bytesToBase64(msg.preview) : null;
 
-        const body = JSON.stringify({
+        lastPayload = {
           fileName: msg.fileName,
           node: msg.node,
           assets: { svg, png },
           preview,
           variables: msg.variables || [],
-        });
+        };
 
-        const mb = (body.length / 1048576).toFixed(1);
-        $("stats").textContent += " · " + mb + " МБ";
+        if (msg.stats)
+          $("stats").textContent =
+            "Слоёв: " + msg.stats.layers + " · ассетов: " + msg.stats.assets +
+            (msg.stats.variables ? " · токенов: " + msg.stats.variables : "");
+        if (preview) $("figmaImg").src = preview;
 
-        const base = $("endpoint").value.replace(/\/+$/, "");
-        status("Отправляю в приложение…");
-        try {
-          const res = await fetch(base + "/api/plugin/ingest", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body,
-          });
-          if (res.ok) status("Отправлено ✓ — смотрите приложение.", "ok");
-          else if (res.status === 413)
-            status(
-              "Слишком большой блок (" + mb + " МБ, лимит 25). Выберите блок поменьше.",
-              "err",
-            );
-          else status("Ошибка приложения: HTTP " + res.status, "err");
-        } catch (e) {
-          status("Не достучался до приложения. Запущено ли оно?", "err");
-        } finally {
-          $("send").disabled = !selectionCount;
-        }
+        if (wantIngest) await ingest();
+        else await convert();
       };
     </script>
   </body>

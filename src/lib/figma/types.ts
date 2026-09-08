@@ -9,7 +9,8 @@ export interface FigmaColor {
 }
 
 export interface FigmaPaint {
-  type: "SOLID" | "GRADIENT_LINEAR" | "GRADIENT_RADIAL" | "IMAGE" | string;
+  /** "VIDEO" is treated like "IMAGE": exported as the clip's first frame. */
+  type: "SOLID" | "GRADIENT_LINEAR" | "GRADIENT_RADIAL" | "IMAGE" | "VIDEO" | string;
   visible?: boolean;
   opacity?: number;
   color?: FigmaColor;
@@ -54,6 +55,8 @@ export interface FigmaTypeStyle {
   italic?: boolean;
   /** Token name when the font size is bound to a Figma variable. */
   fontSizeVar?: string;
+  /** Name of the shared text style applied to the node ("Heading/H1" → "heading-h1"). */
+  textStyleName?: string;
 }
 
 export type LayoutMode = "NONE" | "HORIZONTAL" | "VERTICAL";
@@ -67,6 +70,12 @@ export interface FigmaNode {
   children?: FigmaNode[];
 
   absoluteBoundingBox?: FigmaRect;
+  /**
+   * The node's own (un-rotated) width/height — x is width, y is height. For a
+   * rotated node absoluteBoundingBox is the AABB of the *rotated* shape, from
+   * which the original size can't always be recovered (at exactly 45° the
+   * equations are singular), so this is the authoritative source when present.
+   */
   size?: { x: number; y: number };
 
   fills?: FigmaPaint[];
@@ -93,6 +102,14 @@ export interface FigmaNode {
   paddingBottomVar?: string;
   cornerRadiusVar?: string;
 
+  // Classic shared styles, resolved to sanitized names by the plugin.
+  /** Name of the shared paint style applied to the node's fills. */
+  fillStyleName?: string;
+  /** Name of the shared paint style applied to the node's strokes. */
+  strokeStyleName?: string;
+  /** Name of the shared effect style applied to the node. */
+  effectStyleName?: string;
+
   // Component provenance (INSTANCE / COMPONENT), for naming & componentization.
   componentName?: string;
   variantProperties?: Record<string, string>;
@@ -106,6 +123,13 @@ export interface FigmaNode {
   swapProp?: string;
   /** Designer explicitly marked this node "Export as SVG" → treat as one icon. */
   svgExport?: boolean;
+  /**
+   * This layer clips its following siblings (Figma mask). CSS has no
+   * equivalent for an arbitrary vector mask, so the masked group must be
+   * flattened into one SVG asset — otherwise only the *masked* rectangle
+   * renders, as a solid block the size of the whole group.
+   */
+  isMask?: boolean;
 
   // Prototype interactions (plugin reads node.reactions).
   /** Destination URL of an OPEN_URL click reaction → real <a href>. */
@@ -149,6 +173,9 @@ export interface FigmaNode {
   primaryAxisSizingMode?: "FIXED" | "AUTO";
   counterAxisSizingMode?: "FIXED" | "AUTO";
   itemSpacing?: number;
+  /** Cross-axis gap between wrapped rows/columns (Figma wrap auto-layout, or the
+   *  synthetic grid the geometric flow detector builds). */
+  counterAxisSpacing?: number;
   paddingLeft?: number;
   paddingRight?: number;
   paddingTop?: number;
@@ -174,6 +201,9 @@ export interface FigmaNode {
   // Auto-layout child properties
   /** "ABSOLUTE" — the child is taken out of the auto-layout flow. */
   layoutPositioning?: "AUTO" | "ABSOLUTE";
+  /** internal: a full-bleed background layer the flow detector kept as an
+   *  absolute overlay — must paint behind its in-flow siblings (-z-10). */
+  bgLayer?: boolean;
   /** "STRETCH" — fill the parent's counter axis. */
   layoutAlign?: "INHERIT" | "STRETCH" | "MIN" | "CENTER" | "MAX";
   /** > 0 — grow along the parent's primary axis. */

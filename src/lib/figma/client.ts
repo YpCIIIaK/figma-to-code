@@ -2,6 +2,7 @@ import type {
   FigmaFileResponse,
   FigmaNodesResponse,
   FigmaImagesResponse,
+  FigmaNode,
 } from "./types";
 
 const API = "https://api.figma.com/v1";
@@ -134,6 +135,22 @@ async function figmaFetch<T>(
     }
     return res.json() as Promise<T>;
   }
+}
+
+/**
+ * The REST API reports rotation in radians, counter-clockwise; the converter
+ * (and the plugin payload it was modelled on) speaks CSS degrees, clockwise.
+ * Without this every rotated node arrives as a fraction of a degree — a 45°
+ * shape lands essentially unrotated, and its size is derived from the rotated
+ * bounding box, so it renders both too big and in the wrong place.
+ */
+export function normalizeRotation<T extends FigmaNode>(node: T): T {
+  if (typeof node.rotation === "number" && node.rotation !== 0) {
+    const deg = -(node.rotation * 180) / Math.PI;
+    node.rotation = Math.abs(deg) < 1e-6 ? 0 : deg;
+  }
+  for (const c of node.children ?? []) normalizeRotation(c);
+  return node;
 }
 
 /** Fetch a whole file document. */

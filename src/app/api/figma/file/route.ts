@@ -1,5 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getFile, getNodes, parseFigmaUrl, FigmaError } from "@/lib/figma/client";
+import {
+  getFile,
+  getNodes,
+  parseFigmaUrl,
+  normalizeRotation,
+  FigmaError,
+} from "@/lib/figma/client";
 import { toTree, findNode } from "@/lib/figma/tree";
 import type { FigmaNode } from "@/lib/figma/types";
 
@@ -44,6 +50,10 @@ export async function POST(req: NextRequest) {
       const firstPage = file.document.children?.[0];
       root = firstPage ?? file.document;
     }
+
+    // REST speaks radians; the converter speaks CSS degrees (as the plugin
+    // payload does). Normalize once, at the boundary.
+    normalizeRotation(root);
 
     return NextResponse.json({
       fileKey,

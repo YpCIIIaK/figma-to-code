@@ -15,6 +15,136 @@ function frame(props: Partial<FigmaNode>): FigmaNode {
 }
 
 describe("converter: visual fidelity", () => {
+  it("derives the linear-gradient angle in pixel space, not handle space", () => {
+    // Handles run corner-to-corner of a 200x100 box: 45° in normalised handle
+    // space, but ~63.4° on screen.
+    const n = frame({
+      absoluteBoundingBox: box(200, 100),
+      fills: [
+        {
+          type: "GRADIENT_LINEAR",
+          gradientHandlePositions: [
+            { x: 0, y: 0 },
+            { x: 1, y: 1 },
+          ],
+          gradientStops: [
+            { position: 0, color: { r: 1, g: 0, b: 0, a: 1 } },
+            { position: 1, color: { r: 0, g: 0, b: 1, a: 1 } },
+          ],
+        },
+      ],
+    });
+    const m = /linear-gradient\((\d+(?:\.\d+)?)deg/.exec(convertNode(n).html);
+    expect(m).toBeTruthy();
+    expect(Number(m![1])).toBeCloseTo(116.57, 0);
+  });
+
+  it("remaps stop offsets onto the CSS gradient line", () => {
+    // A horizontal gradient covering only the middle half of the box must keep
+    // that extent — CSS would otherwise stretch it edge to edge.
+    const n = frame({
+      absoluteBoundingBox: box(100, 100),
+      fills: [
+        {
+          type: "GRADIENT_LINEAR",
+          gradientHandlePositions: [
+            { x: 0.25, y: 0.5 },
+            { x: 0.75, y: 0.5 },
+          ],
+          gradientStops: [
+            { position: 0, color: { r: 1, g: 0, b: 0, a: 1 } },
+            { position: 1, color: { r: 0, g: 0, b: 1, a: 1 } },
+          ],
+        },
+      ],
+    });
+    const html = convertNode(n).html;
+    expect(html).toContain("linear-gradient(90deg");
+    expect(html).toContain("25%");
+    expect(html).toContain("75%");
+  });
+
+  it("folds the paint opacity into the gradient stops", () => {
+    const n = frame({
+      fills: [
+        {
+          type: "GRADIENT_LINEAR",
+          opacity: 0.5,
+          gradientAngle: 180,
+          gradientStops: [
+            { position: 0, color: { r: 1, g: 0, b: 0, a: 1 } },
+            { position: 1, color: { r: 0, g: 0, b: 1, a: 1 } },
+          ],
+        },
+      ],
+    });
+    expect(convertNode(n).html).toContain("rgba(255,0,0,0.5)");
+  });
+
+  it("scales radial radii per axis on a non-square box", () => {
+    const n = frame({
+      absoluteBoundingBox: box(200, 100),
+      fills: [
+        {
+          type: "GRADIENT_RADIAL",
+          gradientHandlePositions: [
+            { x: 0.5, y: 0.5 },
+            { x: 1, y: 0.5 },
+            { x: 0.5, y: 1 },
+          ],
+          gradientStops: [
+            { position: 0, color: { r: 1, g: 1, b: 1, a: 1 } },
+            { position: 1, color: { r: 0, g: 0, b: 0, a: 1 } },
+          ],
+        },
+      ],
+    });
+    expect(convertNode(n).html).toContain("radial-gradient(ellipse 50% 50% at 50% 50%");
+  });
+
+  it("clips a gradient text fill to the glyphs", () => {
+    const n = {
+      id: "1:2",
+      name: "Title",
+      type: "TEXT",
+      characters: "Hi",
+      absoluteBoundingBox: box(100, 20),
+      fills: [
+        {
+          type: "GRADIENT_LINEAR",
+          gradientAngle: 90,
+          gradientStops: [
+            { position: 0, color: { r: 1, g: 0, b: 0, a: 1 } },
+            { position: 1, color: { r: 0, g: 0, b: 1, a: 1 } },
+          ],
+        },
+      ],
+    } as unknown as FigmaNode;
+    const html = convertNode(n).html;
+    expect(html).toContain("bg-clip-text");
+    expect(html).toContain("text-transparent");
+    expect(html).toContain("linear-gradient(");
+  });
+
+  it("paints a gradient stroke with border-image", () => {
+    const n = frame({
+      strokeWeight: 2,
+      strokes: [
+        {
+          type: "GRADIENT_LINEAR",
+          gradientAngle: 90,
+          gradientStops: [
+            { position: 0, color: { r: 1, g: 0, b: 0, a: 1 } },
+            { position: 1, color: { r: 0, g: 0, b: 1, a: 1 } },
+          ],
+        },
+      ],
+    });
+    const html = convertNode(n).html;
+    expect(html).toContain("border-image");
+    expect(html).toContain("2px solid transparent");
+  });
+
   it("uses the real gradient angle from the plugin", () => {
     const n = frame({
       fills: [
@@ -625,6 +755,871 @@ describe("converter: FigmaToCode-inspired features", () => {
     );
   });
 
+  it("flattens a single curved-text node (text on a path) into an SVG asset", () => {
+    // A ring of text: one TEXT node whose 180×180 box is far taller than its
+    // ~3 wrapped lines would be — the geometry heuristic must fire.
+    const n = {
+      id: "18:1",
+      name: "Оставьте заявку",
+      type: "TEXT",
+      characters:
+        "Оставьте заявку / Оставьте заявку / Оставьте заявку / Оставьте заявку /",
+      absoluteBoundingBox: box(180, 180),
+      style: { fontSize: 12, lineHeightPx: 14 },
+    } as FigmaNode;
+    const { html, assets } = convertNode(n);
+    expect(assets).toHaveLength(1);
+    expect(assets[0].kind).toBe("svg");
+    expect(html).toContain("@@ASSET:");
+    expect(html).toContain("w-[180px]");
+    expect(html).not.toContain("Оставьте заявку /");
+  });
+
+  it("honours the plugin's svgExport mark on a text node", () => {
+    const n = {
+      id: "19:1",
+      name: "Arc",
+      type: "TEXT",
+      svgExport: true,
+      characters: "along a path",
+      absoluteBoundingBox: box(120, 40),
+      style: { fontSize: 14 },
+    } as FigmaNode;
+    const { assets } = convertNode(n);
+    expect(assets).toHaveLength(1);
+    expect(assets[0].kind).toBe("svg");
+  });
+
+  it("keeps a tall wrapped paragraph as text, not an SVG", () => {
+    // 300×280 body copy: many wrapped lines fully explain the height.
+    const long = "слово ".repeat(80).trim();
+    const n = {
+      id: "20:1",
+      name: "Body",
+      type: "TEXT",
+      characters: long,
+      textAutoResize: "HEIGHT",
+      absoluteBoundingBox: box(300, 280),
+      style: { fontSize: 16, lineHeightPx: 20 },
+    } as FigmaNode;
+    const { html, assets } = convertNode(n);
+    expect(assets).toHaveLength(0);
+    expect(html).toContain("слово");
+  });
+
+  it("flattens circular text (rotated letters) into one SVG asset", () => {
+    const letters = ["О", "с", "т", "а", "в", "ь"].map((ch, i) => ({
+      id: `14:${i}`,
+      name: ch,
+      type: "TEXT",
+      characters: ch,
+      rotation: -60 + i * 24,
+      absoluteBoundingBox: box(12, 14, 80 + i * 10, 10),
+      style: { fontSize: 12 },
+    })) as FigmaNode[];
+    const ring = frame({
+      name: "Ring",
+      absoluteBoundingBox: box(180, 180),
+      children: letters,
+    });
+    const { html, assets } = convertNode(ring);
+    expect(assets).toHaveLength(1);
+    expect(assets[0].kind).toBe("svg");
+    expect(html).toContain("@@ASSET:");
+    // The letters must not leak out as individual <p> elements.
+    expect(html).not.toContain(">О<");
+  });
+
+  it("ignores an svgExport mark on a section that holds real text", () => {
+    // Designers routinely leave export settings on a whole section; obeying
+    // that would flatten every heading and paragraph into one picture.
+    const n = frame({
+      name: "Структура авторынка",
+      svgExport: true,
+      absoluteBoundingBox: box(1340, 530),
+      children: [
+        {
+          id: "21:1",
+          name: "t",
+          type: "TEXT",
+          characters: "53%",
+          absoluteBoundingBox: box(120, 60, 40, 40),
+          style: { fontSize: 48 },
+        } as FigmaNode,
+        { id: "21:2", name: "v", type: "VECTOR", absoluteBoundingBox: box(20, 20, 900, 40) } as FigmaNode,
+      ],
+    });
+    const { html } = convertNode(n);
+    expect(html).toContain("53%");
+  });
+
+  it("does not flatten a wide section that merely contains ring labels", () => {
+    // Rotated donut-chart captions next to upright stat text: the section is
+    // 1340×530, nothing like the square box of an actual text ring.
+    const captions = ["ЛОКАЛЬНОЕ", "ИМПОРТ", "ДОЛЯ"].map((ch, i) => ({
+      id: `22:${i}`,
+      name: ch,
+      type: "TEXT",
+      characters: ch,
+      rotation: -40 + i * 30,
+      absoluteBoundingBox: box(120, 16, 900 + i * 40, 60 + i * 160),
+      style: { fontSize: 12 },
+    })) as FigmaNode[];
+    const n = frame({
+      name: "Структура",
+      absoluteBoundingBox: box(1340, 530),
+      children: captions,
+    });
+    const { html, assets } = convertNode(n);
+    expect(assets).toHaveLength(0);
+    expect(html).toContain("ИМПОРТ");
+  });
+
+  it("flattens a word split into per-glyph text nodes (text on a path)", () => {
+    // Figma's path text: one TEXT node per letter, each tilted a degree or two
+    // along a gentle arc. As HTML it explodes into absolutely-placed <p>s.
+    const glyphs = "ЛОКАЛЬНОЕ".split("").map((ch, i) => ({
+      id: `25:${i}`,
+      name: ch,
+      type: "TEXT",
+      characters: ch,
+      rotation: 1.6 + i * 0.05,
+      absoluteBoundingBox: box(12, 22, i * 12, i * i * 0.2),
+      style: { fontSize: 18 },
+    })) as FigmaNode[];
+    const n = frame({
+      name: "Linked Path Group",
+      type: "GROUP",
+      absoluteBoundingBox: box(241, 117),
+      children: glyphs,
+    });
+    const { html, assets } = convertNode(n);
+    expect(assets).toHaveLength(1);
+    expect(assets[0].kind).toBe("svg");
+    expect(html).not.toContain(">Л<");
+  });
+
+  it("exports a raster-masked group as PNG, not SVG", () => {
+    // A photo clipped by a mask has no vectors to keep — an SVG export would
+    // just wrap the bitmap in base64.
+    const n = frame({
+      name: "Mask group",
+      type: "GROUP",
+      absoluteBoundingBox: box(464, 273),
+      children: [
+        {
+          id: "26:1",
+          name: "map",
+          type: "RECTANGLE",
+          isMask: true,
+          absoluteBoundingBox: box(464, 273),
+          fills: [{ type: "IMAGE", scaleMode: "STRETCH", imageRef: "x" }],
+        } as unknown as FigmaNode,
+        {
+          id: "26:2",
+          name: "fill",
+          type: "RECTANGLE",
+          absoluteBoundingBox: box(461, 285),
+          fills: [{ type: "SOLID", color: { r: 1, g: 0.44, b: 0.02, a: 1 } }],
+        } as FigmaNode,
+      ],
+    });
+    const { assets } = convertNode(n);
+    expect(assets).toHaveLength(1);
+    expect(assets[0].kind).toBe("png");
+  });
+
+  it("recovers a square node's size at exactly 45° (the singular case)", () => {
+    // A 289px donut ring turned 45°: its AABB is 289·√2 ≈ 409. Inverting the
+    // general equations is singular here, but a square has one unknown.
+    const n = frame({
+      name: "Ellipse",
+      type: "ELLIPSE",
+      rotation: 45,
+      absoluteBoundingBox: box(409, 409, 0, 0),
+      arcData: { startingAngle: 0, endingAngle: 4.54, innerRadius: 0.7 },
+    });
+    const { assets } = convertNode(n);
+    expect(assets).toHaveLength(1);
+    expect(assets[0].className).toMatch(/w-\[289px\]/);
+    expect(assets[0].className).toMatch(/h-\[289px\]/);
+  });
+
+  it("prefers the plugin's exact size over inverting the bounding box", () => {
+    const n = frame({
+      name: "Card",
+      rotation: 45,
+      size: { x: 200, y: 100 },
+      absoluteBoundingBox: box(212, 212),
+    });
+    const { html } = convertNode(n);
+    expect(html).toContain("w-[200px]");
+    expect(html).toContain("h-[100px]");
+  });
+
+  it("keeps a full-width row of cards on one line despite the container stroke", () => {
+    // Three cards of 447+446+447 = exactly the container's 1340px. A CSS border
+    // would shrink the content box to 1338 and bounce the last card onto the
+    // next line; a Figma stroke never takes layout space.
+    const card = (id: string, w: number) =>
+      frame({
+        id,
+        name: "Card",
+        absoluteBoundingBox: box(w, 120),
+        layoutSizingHorizontal: "FIXED",
+      });
+    const n = frame({
+      name: "Content",
+      absoluteBoundingBox: box(1340, 240),
+      layoutMode: "HORIZONTAL",
+      layoutWrap: "WRAP",
+      strokes: [{ type: "SOLID", color: { r: 0, g: 0, b: 0, a: 0.3 } }],
+      strokeWeight: 1,
+      strokeAlign: "INSIDE",
+      children: [card("28:1", 447), card("28:2", 446), card("28:3", 447)],
+    });
+    const { html } = convertNode(n);
+    expect(html).toContain("outline:");
+    expect(html).toContain("outline-offset: -1px");
+    expect(html).not.toContain("border-[1px]");
+  });
+
+  it("gives FILL children a zero basis so they split the row evenly", () => {
+    const kid = (id: string, chars: string) =>
+      frame({
+        id,
+        name: "Cell",
+        absoluteBoundingBox: box(400, 80),
+        layoutSizingHorizontal: "FILL",
+        children: [
+          {
+            id: id + "t",
+            name: "t",
+            type: "TEXT",
+            characters: chars,
+            absoluteBoundingBox: box(380, 40),
+            style: { fontSize: 16 },
+          } as FigmaNode,
+        ],
+      });
+    const n = frame({
+      name: "Row",
+      absoluteBoundingBox: box(1200, 80),
+      layoutMode: "HORIZONTAL",
+      layoutWrap: "WRAP",
+      children: [kid("29:1", "короткий"), kid("29:2", "заметно более длинный текст в ячейке")],
+    });
+    const { html } = convertNode(n);
+    // Both cells must carry grow + basis-0, or the longer one takes more room.
+    expect(html.match(/grow basis-0|basis-0 grow/g)?.length).toBe(2);
+  });
+
+  it("keeps a 90°-rotated line vertical when it is exported", () => {
+    // Figma draws every LINE horizontally and rotates it, so a grid line is a
+    // 369px line turned 90°. The export is rendered as it appears — vertical —
+    // so the <img> must take the rotated bounding box, not the un-rotated one.
+    // Sized 369px wide it would blow open the column it sits in.
+    const n = frame({
+      name: "Line 3",
+      type: "LINE",
+      rotation: 90,
+      size: { x: 369, y: 0 },
+      // Rotating leaves floating-point dust in the box — not a clean zero.
+      absoluteBoundingBox: { x: 100, y: 0, width: 2.2e-13, height: 369 },
+      strokeWeight: 1,
+      strokes: [{ type: "SOLID", color: { r: 0.85, g: 0.85, b: 0.85, a: 1 } }],
+    });
+    const { html, assets } = convertNode(n);
+    expect(assets).toHaveLength(1);
+    expect(html).toContain("w-[1px]");
+    expect(html).toContain("h-[369px]");
+    expect(html).not.toContain("w-[369px]");
+    // The export already carries the rotation — rotating again would undo it.
+    expect(html).not.toContain("rotate-");
+  });
+
+  it("keeps opacity, blur and blend mode on an exported image", () => {
+    // The map layer is a photo at 73% in DIFFERENCE mode with an 18px blur.
+    // Emitting those after the asset short-circuit dropped them silently.
+    const n = frame({
+      name: "2 27",
+      type: "RECTANGLE",
+      absoluteBoundingBox: box(1012, 488),
+      fills: [{ type: "IMAGE", scaleMode: "CROP" }],
+      opacity: 0.73,
+      blendMode: "DIFFERENCE",
+      effects: [{ type: "LAYER_BLUR", visible: true, radius: 17.9 }],
+    } as unknown as Partial<FigmaNode>);
+    const { html, assets } = convertNode(n);
+    expect(assets).toHaveLength(1);
+    expect(html).toContain("opacity-[0.73]");
+    expect(html).toContain("blur-[18px]");
+    expect(html).toContain("mix-blend-difference");
+  });
+
+  it("keeps a drop shadow on an exported icon", () => {
+    const n = frame({
+      name: "Pin",
+      type: "VECTOR",
+      absoluteBoundingBox: box(28, 28),
+      effects: [
+        {
+          type: "DROP_SHADOW",
+          visible: true,
+          radius: 4,
+          offset: { x: 0, y: 2 },
+          color: { r: 0, g: 0, b: 0, a: 0.25 },
+        },
+      ],
+    } as unknown as Partial<FigmaNode>);
+    expect(convertNode(n).html).toContain("shadow-[0px_2px_4px_0px");
+  });
+
+  it("keeps line breaks inside styled text runs", () => {
+    // Mixed styling emits <span> runs; a raw newline in one of them collapses
+    // to a space, joining a two-line caption into one.
+    const n = frame({
+      name: "caption",
+      type: "TEXT",
+      characters: "Автомобильные дороги:\nулучшено.",
+      absoluteBoundingBox: box(178, 24),
+      style: { fontSize: 8, lineHeightPx: 12 },
+      styledSegments: [
+        { characters: "Автомобильные дороги:\n", fontWeight: 600 },
+        { characters: "улучшено.", fontWeight: 400 },
+      ],
+    } as unknown as Partial<FigmaNode>);
+    const { code, html } = convertNode(n);
+    expect(code).toContain("Автомобильные дороги:<br />");
+    expect(html).toContain("Автомобильные дороги:<br />");
+    expect(code).not.toMatch(/дороги:\s*\n/);
+  });
+
+  it("flattens a frame whose children undo its rotation", () => {
+    // A caption block built sideways: frame at +90°, every child at -90°, so
+    // nothing is turned on screen. Reproduced literally, the flex row sizes the
+    // children along the wrong axis and throws them outside the frame.
+    const kid = (id: string, x: number, y: number, w: number, h: number) =>
+      ({
+        id,
+        name: "line",
+        type: "TEXT",
+        characters: "текст",
+        rotation: -90,
+        absoluteBoundingBox: box(w, h, x, y),
+        style: { fontSize: 11 },
+      }) as FigmaNode;
+    const n = frame({
+      name: "Frame 427319025",
+      rotation: 90,
+      absoluteBoundingBox: box(144, 87, 1000, 40),
+      layoutMode: "HORIZONTAL",
+      itemSpacing: 11,
+      layoutSizingHorizontal: "HUG",
+      layoutSizingVertical: "HUG",
+      children: [kid("30:1", 1000, 40, 144, 16), kid("30:2", 1000, 60, 144, 63)],
+    });
+    const { html } = convertNode(n, { absolutePositioning: true });
+    // No rotation survives, and the children sit at their real offsets.
+    expect(html).not.toContain("rotate-");
+    expect(html).toContain("w-[144px]");
+    expect(html).toContain("top-[20px]");
+    // The frame keeps a size: its children are pinned now, so hugging them
+    // would collapse it to nothing and the text would spill out.
+    expect(html).toMatch(/w-\[144px\][^"]*h-\[87px\]/);
+  });
+
+  it("draws a donut segment as inline SVG instead of exporting it", () => {
+    // 260° of a ring, turned -45°. Exporting this as an image never lines up:
+    // the bounding box is the rotated square's AABB, the export is bounded by
+    // the drawn arc. Drawn from the geometry it is exact.
+    const n = frame({
+      name: "Ellipse 4002",
+      type: "ELLIPSE",
+      rotation: -45,
+      absoluteBoundingBox: box(410, 410, 0, 0),
+      arcData: { startingAngle: 0, endingAngle: 4.5427, innerRadius: 0.7 },
+      fills: [{ type: "SOLID", color: { r: 1, g: 0.44, b: 0.02, a: 1 } }],
+    });
+    const { html, assets } = convertNode(n);
+    expect(assets).toHaveLength(0);
+    expect(html).toContain("<svg");
+    expect(html).toContain('viewBox="0 0 290 290"');
+    // Figma's angles are already clockwise on screen, so the node's -45°
+    // rotation puts the start at -45° — (145 + 145·cos45, 145 - 145·sin45).
+    expect(html).toContain("M 248 42");
+    // ...and the arc runs clockwise from there (sweep flag 1).
+    expect(html).toContain("A 145 145 0 1 1");
+    expect(html).toContain('fill="#ff7005"');
+  });
+
+  it("does not infer a flow when a child is rotated", () => {
+    // A chart's axis captions: the y-axis one is turned -90°, so Figma sees a
+    // tall narrow box on the left and infers a column. CSS lays the element out
+    // by its unrotated box, which would swap the two captions.
+    const n = frame({
+      name: "график",
+      absoluteBoundingBox: box(1340, 527, 0, 0),
+      inferredLayout: {
+        layoutMode: "VERTICAL",
+        itemSpacing: 167,
+        paddingLeft: 0,
+        paddingRight: 601,
+        paddingTop: 161,
+        paddingBottom: 0,
+      },
+      children: [
+        frame({
+          name: "Марки автомобилей",
+          type: "TEXT",
+          characters: "Марки автомобилей",
+          rotation: -90,
+          absoluteBoundingBox: box(23, 160, 0, 161),
+        }),
+        frame({
+          name: "Продажи шт.",
+          type: "TEXT",
+          characters: "Продажи шт.",
+          absoluteBoundingBox: box(110, 23, 620, 500),
+        }),
+      ],
+    });
+    const { html } = convertNode(n, { inferLayout: true, absolutePositioning: true });
+    expect(html).not.toContain("gap-[167px]");
+    // Pinned where the designer put them: the turned caption on the left edge.
+    expect(html).toContain("top-[500px]");
+  });
+
+  it("drops end alignment when the row is wider than its frame", () => {
+    // Figma clips such a frame on the right; justify-end pushes the overflow
+    // off the left instead, where overflow-hidden eats the first column.
+    const n = frame({
+      name: "Автомобильный рынок",
+      layoutMode: "HORIZONTAL",
+      itemSpacing: 53,
+      primaryAxisAlignItems: "MAX",
+      clipsContent: true,
+      absoluteBoundingBox: box(1340, 532),
+      children: [
+        frame({ name: "Table", absoluteBoundingBox: box(756, 532) }),
+        frame({ name: "Photo", absoluteBoundingBox: box(905, 645) }),
+      ],
+    });
+    const { html } = convertNode(n);
+    expect(html).not.toContain("justify-end");
+  });
+
+  it("keeps end alignment when the children do fit", () => {
+    const n = frame({
+      name: "Row",
+      layoutMode: "HORIZONTAL",
+      itemSpacing: 20,
+      primaryAxisAlignItems: "MAX",
+      absoluteBoundingBox: box(1340, 100),
+      children: [
+        frame({ name: "A", absoluteBoundingBox: box(200, 100) }),
+        frame({ name: "B", absoluteBoundingBox: box(200, 100) }),
+      ],
+    });
+    const { html } = convertNode(n);
+    expect(html).toContain("justify-end");
+  });
+
+  it("does not turn a free-form rotated group twice", () => {
+    // Figma keeps the group's rotation relative to its parent but its children's
+    // boxes in absolute coordinates, so the turn is already in those numbers.
+    // Wrapping them in a rotate() moved the circles off their rings.
+    const n = frame({
+      name: "Content",
+      absoluteBoundingBox: box(600, 600, 0, 0),
+      children: [
+        frame({
+          name: "Group 1321314689",
+          rotation: 90,
+          absoluteBoundingBox: box(390, 383, 100, 100),
+          children: [
+            frame({
+              name: "Ellipse 4026",
+              type: "ELLIPSE",
+              rotation: 90,
+              absoluteBoundingBox: box(87, 87, 118, 118),
+            }),
+          ],
+        }),
+      ],
+    });
+    const { html } = convertNode(n, { absolutePositioning: true });
+    expect(html).not.toContain("rotate-[90deg]");
+    // The group keeps the box it really occupies, and the circle sits at its
+    // true offset inside it (18px in from the corner).
+    expect(html).toContain("w-[390px]");
+    expect(html).toContain("h-[383px]");
+    expect(html).toContain("left-[18px]");
+    expect(html).toContain("top-[18px]");
+  });
+
+  it("starts a donut sector where Figma does, running clockwise", () => {
+    // A stacked donut: each sector starts at 12 o'clock (startingAngle -90°)
+    // and sweeps clockwise, later slices painted over earlier ones. Negating
+    // the angle put every sector at 6 o'clock and reversed the slice order,
+    // so the 2% sliver ended up on the wrong side of the chart.
+    const n = frame({
+      name: "Ellipse 3961",
+      type: "ELLIPSE",
+      absoluteBoundingBox: box(567, 567),
+      // 43% of the circle: -90° → 65.8°.
+      arcData: {
+        startingAngle: -Math.PI / 2,
+        endingAngle: -Math.PI / 2 + Math.PI * 2 * 0.43,
+        innerRadius: 0,
+      },
+      fills: [{ type: "SOLID", color: { r: 0.07, g: 0.07, b: 0.07, a: 1 } }],
+    });
+    const { html } = convertNode(n);
+    // Top of the circle, then clockwise (sweep flag 1) through the right side.
+    expect(html).toContain("L 284 0");
+    expect(html).toMatch(/A 284 284 0 0 1 \d/);
+  });
+
+  it("gives a progress ring round ends, not blunt ones", () => {
+    // Figma's cornerRadius on a ring segment rounds its two ends. At half the
+    // ring's thickness the ends are fully round — a stroked centreline with
+    // round caps, not a filled sector.
+    const n = frame({
+      name: "Ellipse 4020",
+      type: "ELLIPSE",
+      absoluteBoundingBox: box(291, 291),
+      // 25% of the ring, 30px thick (outer 145.5, inner 115.5).
+      arcData: { startingAngle: 0, endingAngle: Math.PI / 2, innerRadius: 0.79 },
+      cornerRadius: 24,
+      fills: [{ type: "SOLID", color: { r: 1, g: 0.44, b: 0.02, a: 1 } }],
+    });
+    const { html, code } = convertNode(n);
+    expect(html).toContain('stroke-linecap="round"');
+    expect(code).toContain('strokeLinecap="round"');
+    expect(html).toContain('fill="none"');
+    // A single centreline arc — no "L" back along an inner edge.
+    expect(html).not.toMatch(/<path d="[^"]*L[^"]*"/);
+    // The box radius must not leak out as a CSS border-radius on the <svg>.
+    expect(html).not.toContain("rounded-[24px]");
+  });
+
+  it("keeps blunt ends when the ring has no corner radius", () => {
+    const n = frame({
+      name: "Ellipse",
+      type: "ELLIPSE",
+      absoluteBoundingBox: box(291, 291),
+      arcData: { startingAngle: 0, endingAngle: Math.PI / 2, innerRadius: 0.79 },
+      fills: [{ type: "SOLID", color: { r: 0, g: 0, b: 0, a: 1 } }],
+    });
+    const { html } = convertNode(n);
+    expect(html).not.toContain("stroke-linecap");
+    expect(html).toMatch(/<path d="[^"]*L[^"]*"/);
+  });
+
+  it("draws a full ring (360° with a hole) without fill-rule", () => {
+    const n = frame({
+      name: "Ring",
+      type: "ELLIPSE",
+      absoluteBoundingBox: box(100, 100),
+      arcData: { startingAngle: 0, endingAngle: Math.PI * 2, innerRadius: 0.5 },
+      fills: [{ type: "SOLID", color: { r: 0, g: 0, b: 0, a: 1 } }],
+    });
+    const { html } = convertNode(n);
+    expect(html).not.toContain("fill-rule");
+    // Outer circle clockwise, inner counter-clockwise → the hole.
+    expect(html).toContain("A 50 50 0 1 0");
+    expect(html).toContain("A 25 25 0 1 1");
+  });
+
+  it("keeps a section that contains ringed labels out of the ring test", () => {
+    // 28 rotated glyphs among 39 texts, aspect ~1.9 — every ratio a ring has,
+    // but its children are frames, so it is a layout, not a ring.
+    const glyphs = Array.from({ length: 6 }, (_, i) => ({
+      id: `27:${i}`,
+      name: "г",
+      type: "TEXT",
+      characters: "г",
+      rotation: 30 + i * 10,
+      absoluteBoundingBox: box(12, 14, 600 + i * 12, 300),
+      style: { fontSize: 12 },
+    })) as FigmaNode[];
+    const section = frame({
+      name: "Секция",
+      absoluteBoundingBox: box(1340, 700),
+      children: [
+        frame({ id: "27:100", name: "Ring", absoluteBoundingBox: box(200, 200, 600, 250), children: glyphs }),
+        {
+          id: "27:200",
+          name: "h",
+          type: "TEXT",
+          characters: "Структура авторынка",
+          absoluteBoundingBox: box(400, 24),
+          style: { fontSize: 24 },
+        } as FigmaNode,
+      ],
+    });
+    const { html } = convertNode(section);
+    expect(html).toContain("Структура авторынка");
+  });
+
+  it("flattens a vector-masked group into one SVG asset", () => {
+    // A country map: an outline masks a filled rectangle. Rendered layer by
+    // layer that is just a solid black block the size of the group.
+    const n = frame({
+      name: "Китай",
+      type: "GROUP",
+      absoluteBoundingBox: box(240, 200),
+      children: [
+        {
+          id: "23:1",
+          name: "outline",
+          type: "VECTOR",
+          isMask: true,
+          absoluteBoundingBox: box(240, 200),
+        } as FigmaNode,
+        {
+          id: "23:2",
+          name: "fill",
+          type: "RECTANGLE",
+          absoluteBoundingBox: box(240, 200),
+          fills: [{ type: "SOLID", color: { r: 0, g: 0, b: 0, a: 1 } }],
+        } as FigmaNode,
+      ],
+    });
+    const { html, assets } = convertNode(n);
+    expect(assets).toHaveLength(1);
+    expect(assets[0].kind).toBe("svg");
+    expect(html).toContain("@@ASSET:");
+  });
+
+  it("warns instead of flattening when a masked group holds real text", () => {
+    const n = frame({
+      name: "Карта",
+      absoluteBoundingBox: box(240, 200),
+      children: [
+        {
+          id: "24:1",
+          name: "outline",
+          type: "VECTOR",
+          isMask: true,
+          absoluteBoundingBox: box(240, 200),
+        } as FigmaNode,
+        {
+          id: "24:2",
+          name: "pct",
+          type: "TEXT",
+          characters: "40%",
+          absoluteBoundingBox: box(60, 24, 90, 90),
+          style: { fontSize: 24 },
+        } as FigmaNode,
+      ],
+    });
+    const { html, warnings } = convertNode(n);
+    expect(html).toContain("40%");
+    expect(warnings?.join(" ")).toContain("маска");
+  });
+
+  it("keeps ordinary multi-text containers as HTML (not an SVG)", () => {
+    const texts = [0, 1, 2].map((i) => ({
+      id: `15:${i}`,
+      name: `t${i}`,
+      type: "TEXT",
+      characters: `строка ${i}`,
+      absoluteBoundingBox: box(100, 16, 0, i * 20),
+      style: { fontSize: 14 },
+    })) as FigmaNode[];
+    const n = frame({ name: "List", absoluteBoundingBox: box(100, 60), children: texts });
+    const { assets, html } = convertNode(n);
+    expect(assets).toHaveLength(0);
+    expect(html).toContain("строка 0");
+  });
+
+  it("gives soft-wrapped text its box width instead of whitespace-nowrap", () => {
+    // 2 explicit lines ("...волос\nHairline") rendered as 3 (44px lines in a
+    // 132px box) → the box wraps; the width must be emitted.
+    const n = {
+      id: "16:1",
+      name: "H1",
+      type: "TEXT",
+      characters: "Инновационный центр здоровья волос\nHairline",
+      textAutoResize: "WIDTH_AND_HEIGHT",
+      absoluteBoundingBox: box(450, 132),
+      style: { fontSize: 40, lineHeightPx: 44 },
+    } as FigmaNode;
+    const { html } = convertNode(n);
+    expect(html).toContain("w-[450px]");
+    expect(html).not.toContain("whitespace-nowrap");
+  });
+
+  it("keeps whitespace-nowrap for genuinely hugging single-line text", () => {
+    const n = {
+      id: "17:1",
+      name: "label",
+      type: "TEXT",
+      characters: "результаты",
+      textAutoResize: "WIDTH_AND_HEIGHT",
+      absoluteBoundingBox: box(100, 18),
+      style: { fontSize: 15, lineHeightPx: 18 },
+    } as FigmaNode;
+    const { html } = convertNode(n);
+    expect(html).toContain("whitespace-nowrap");
+    expect(html).not.toContain("w-[100px]");
+  });
+
+  it("keeps the corner radius on an exported image/video asset", () => {
+    const n = frame({
+      name: "Photo",
+      absoluteBoundingBox: box(670, 700),
+      cornerRadius: 40,
+      fills: [{ type: "IMAGE", scaleMode: "FILL" }],
+    });
+    const { html, assets } = convertNode(n);
+    // The <img> itself must carry the rounding…
+    expect(html).toContain("rounded-[40px]");
+    // …and so must the recorded className (HTML/Vue inject it onto inline SVG).
+    expect(assets[0].className).toContain("rounded-[40px]");
+  });
+
+  it("keeps per-corner radii on an exported image asset", () => {
+    const n = frame({
+      name: "Photo",
+      absoluteBoundingBox: box(200, 200),
+      rectangleCornerRadii: [8, 0, 0, 8],
+      fills: [{ type: "IMAGE" }],
+    });
+    const { html } = convertNode(n);
+    expect(html).toContain("rounded-tl-[8px]");
+    expect(html).toContain("rounded-bl-[8px]");
+  });
+
+  it("exports a video fill as a still image asset (first frame)", () => {
+    const n = frame({
+      name: "Clip",
+      absoluteBoundingBox: box(320, 180),
+      fills: [{ type: "VIDEO", scaleMode: "FILL" }],
+    });
+    const { html, assets, warnings } = convertNode(n);
+    // Same path as a photo: a PNG asset rendered as an <img>, not an empty box.
+    expect(assets).toHaveLength(1);
+    expect(assets[0].kind).toBe("png");
+    expect(html).toContain("@@ASSET:");
+    expect(html).toContain("object-cover");
+    // …and it's flagged as lossy, since the motion is gone.
+    expect(warnings?.join(" ")).toContain("первым кадром");
+  });
+
+  it("uses a video fill on a container as a background image", () => {
+    const n = frame({
+      name: "Hero",
+      absoluteBoundingBox: box(800, 400),
+      fills: [{ type: "VIDEO", scaleMode: "FILL" }],
+      children: [
+        {
+          id: "13:1",
+          name: "t",
+          type: "TEXT",
+          absoluteBoundingBox: box(100, 20, 10, 10),
+          characters: "Заголовок",
+          style: { fontSize: 20 },
+        } as FigmaNode,
+      ],
+    });
+    const { html } = convertNode(n);
+    expect(html).toContain("background-image");
+    expect(html).toContain("bg-cover");
+  });
+
+  it("recovers a uniform grid as flex-wrap (opt-in), not absolute soup", () => {
+    // 6 cards, 440×354, in a 3×2 grid with 20px gaps.
+    const cards = [
+      [0, 0], [460, 0], [920, 0],
+      [0, 374], [460, 374], [920, 374],
+    ].map(([x, y], i) =>
+      frame({ id: `9:${i}`, name: "Card", absoluteBoundingBox: box(440, 354, x, y) }),
+    );
+    const parent = frame({
+      name: "Cards",
+      absoluteBoundingBox: box(1360, 728),
+      children: cards,
+    });
+    const { code } = convertNode(parent, { absolutePositioning: true, inferLayout: true });
+    expect(code).toContain("flex");
+    expect(code).toContain("flex-wrap");
+    expect(code).toContain("gap-[20px]");
+    // Cards flow — no absolute left/top pinning on them.
+    expect(code).not.toContain("left-[460px]");
+  });
+
+  it("folds a full-bleed background leaf into the container and flows the rest", () => {
+    // A 1440×894 frame: full-bleed white bg rect + header (y=40) + grid (y=126).
+    const parent = frame({
+      name: "Results",
+      absoluteBoundingBox: box(1440, 894),
+      children: [
+        frame({
+          id: "11:0",
+          name: "Bg",
+          absoluteBoundingBox: box(1440, 894, 0, 0),
+          cornerRadius: 50,
+          fills: [{ type: "SOLID", color: { r: 1, g: 1, b: 1, a: 1 } }],
+        }),
+        frame({ id: "11:1", name: "Header", absoluteBoundingBox: box(1360, 46, 40, 40) }),
+        frame({ id: "11:2", name: "Grid", absoluteBoundingBox: box(1360, 728, 40, 126) }),
+      ],
+    });
+    const { code } = convertNode(parent, { absolutePositioning: true, inferLayout: true });
+    // Container flows as a column with padding from the frame edges…
+    expect(code).toContain("flex-col");
+    expect(code).toContain("p-[40px]"); // pl=pr=pt=pb=40 → single shorthand
+    // …and the background rect is folded into the container itself, not a layer.
+    expect(code).toContain("bg-[#ffffff]");
+    expect(code).toContain("rounded-[50px]");
+    expect(code).not.toContain("-z-10");
+    expect(code).not.toContain("isolate");
+    // Header/grid are no longer pinned by top offset.
+    expect(code).not.toContain("top-[126px]");
+  });
+
+  it("keeps a background as a -z-10 overlay when the parent has its own fill", () => {
+    // Parent already has a fill, so the bg leaf can't be folded in — it stays an
+    // absolute overlay pushed behind the flow (isolate + -z-10).
+    const parent = frame({
+      name: "Panel",
+      absoluteBoundingBox: box(1440, 894),
+      fills: [{ type: "SOLID", color: { r: 0.9, g: 0.9, b: 0.9, a: 1 } }],
+      children: [
+        frame({
+          id: "12:0",
+          name: "Bg",
+          absoluteBoundingBox: box(1440, 894, 0, 0),
+          fills: [{ type: "SOLID", color: { r: 1, g: 1, b: 1, a: 1 } }],
+        }),
+        frame({ id: "12:1", name: "Header", absoluteBoundingBox: box(1360, 46, 40, 40) }),
+        frame({ id: "12:2", name: "Grid", absoluteBoundingBox: box(1360, 728, 40, 126) }),
+      ],
+    });
+    const { code } = convertNode(parent, { absolutePositioning: true, inferLayout: true });
+    expect(code).toContain("flex-col");
+    expect(code).toContain("isolate");
+    expect(code).toContain("-z-10");
+  });
+
+  it("keeps overlapping free-form children absolute (not a grid)", () => {
+    const parent = frame({
+      name: "Art",
+      absoluteBoundingBox: box(400, 400),
+      children: [
+        frame({ id: "10:1", name: "A", absoluteBoundingBox: box(300, 300, 0, 0) }),
+        frame({ id: "10:2", name: "B", absoluteBoundingBox: box(300, 300, 50, 50) }),
+        frame({ id: "10:3", name: "C", absoluteBoundingBox: box(300, 300, 80, 80) }),
+      ],
+    });
+    const { code } = convertNode(parent, { absolutePositioning: true, inferLayout: true });
+    expect(code).toContain("absolute");
+    expect(code).not.toContain("flex-wrap");
+  });
+
   it("leaves layout absolute when the infer flag is off", () => {
     const parent = frame({
       name: "Row",
@@ -636,7 +1631,7 @@ describe("converter: FigmaToCode-inspired features", () => {
     expect(code).not.toContain("gap-[12px]");
   });
 
-  it("reports a warning for an angular gradient", () => {
+  it("maps an angular gradient to a conic gradient", () => {
     const n = frame({
       fills: [
         {
@@ -648,8 +1643,8 @@ describe("converter: FigmaToCode-inspired features", () => {
         },
       ],
     });
-    const { warnings } = convertNode(n);
-    expect(warnings?.some((w) => /GRADIENT_ANGULAR/.test(w))).toBe(true);
+    const { code } = convertNode(n);
+    expect(code).toContain("conic-gradient(");
   });
 
   it("has no warnings for a plain frame", () => {
@@ -690,5 +1685,63 @@ describe("converter: FigmaToCode-inspired features", () => {
     const { code } = convertNode(n);
     expect(code).toContain("text-[rgba(255,255,255,0.6)]");
     expect(code).not.toMatch(/rgba\([^)]*\s/); // no whitespace inside rgba()
+  });
+});
+
+describe("converter: layer & style names", () => {
+  const text = (name: string, style: Record<string, unknown>): FigmaNode =>
+    ({
+      id: "2:1",
+      name,
+      type: "TEXT",
+      characters: "Hello",
+      absoluteBoundingBox: box(100, 24),
+      style,
+    }) as unknown as FigmaNode;
+
+  it("keeps layer and style names as data attributes when asked", () => {
+    const n = frame({
+      name: "Card / Header",
+      fillStyleName: "surface-raised",
+      children: [text("Label", { fontSize: 16, textStyleName: "body-regular" })],
+    });
+    const { html } = convertNode(n, { layerNames: true });
+    expect(html).toContain('data-name="Card / Header"');
+    expect(html).toContain('data-style="surface-raised"');
+    expect(html).toContain('data-name="Label"');
+    expect(html).toContain('data-style="body-regular"');
+  });
+
+  it("omits the annotations by default", () => {
+    const n = frame({ name: "Card", fillStyleName: "surface-raised" });
+    expect(convertNode(n).html).not.toContain("data-name");
+  });
+
+  it("takes the heading level from the shared text style", () => {
+    const n = text("Some marketing copy", { fontSize: 14, textStyleName: "heading-h3" });
+    expect(convertNode(n, { semantic: true }).html).toContain("<h3");
+  });
+
+  it("still collapses a repeated list whose items are named differently", () => {
+    const item = (i: number): FigmaNode =>
+      frame({
+        id: `3:${i}`,
+        name: `Card ${i}`,
+        layoutMode: "VERTICAL",
+        children: [
+          {
+            ...(text("Title", { fontSize: 16 }) as FigmaNode),
+            id: `4:${i}`,
+            characters: `Card ${i}`,
+          },
+        ],
+      });
+    const n = frame({
+      name: "List",
+      layoutMode: "HORIZONTAL",
+      children: [item(1), item(2), item(3)],
+    });
+    const { jsx } = convertNode(n, { layerNames: true });
+    expect(jsx).toContain(".map(");
   });
 });

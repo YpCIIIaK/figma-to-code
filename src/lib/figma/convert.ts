@@ -12,6 +12,8 @@ export interface AssetRef {
   id: string;
   kind: "svg" | "png";
   className: string;
+  /** source layer name — used to name the file when assets are emitted as paths */
+  name?: string;
 }
 
 type IRTag =
@@ -54,6 +56,18 @@ interface IRElement {
   slotProp?: string;
   /** set when this element is an exported asset (icon/image) */
   asset?: { id: string; kind: "svg" | "png" };
+  /** set when we draw the shape ourselves (arc / donut segment) */
+  svg?: { viewBox: string; shapes: SvgShape[] };
+}
+
+/** One drawn path inside a generated <svg> (see arcShapes). */
+interface SvgShape {
+  d: string;
+  fill: string;
+  stroke?: string;
+  strokeWidth?: number;
+  /** round caps — a ring segment drawn as a stroked centreline (see arcShapes) */
+  linecap?: "round";
 }
 
 export interface ConvertOptions {
@@ -77,6 +91,8 @@ export interface ConvertOptions {
   propNames?: Set<string>;
   /** internal: distinct text font sizes in the tree (desc), for relative headings */
   textSizes?: number[];
+  /** annotate every block with its Figma layer / style name (data-name, data-style) */
+  layerNames?: boolean;
   /** internal: shared sink for conversion warnings (lossy / unsupported cases) */
   warnings?: string[];
 }
@@ -186,6 +202,111 @@ function subtreeHasText(n: FigmaNode): boolean {
   return (n.children ?? []).some(subtreeHasText);
 }
 
+/**
+ * Text that a reader is meant to select and search: upright, and not a single
+ * decorative glyph. Rotated ring labels don't count — those only survive as a
+ * flattened SVG anyway.
+ */
+function subtreeHasRealText(n: FigmaNode): boolean {
+  if (
+    n.type === "TEXT" &&
+    Math.abs(n.rotation ?? 0) <= 10 &&
+    !isCurvedTextNode(n) &&
+    (n.characters ?? "").trim().length > 1
+  )
+    return true;
+  return (n.children ?? []).some(subtreeHasRealText);
+}
+
+/**
+ * A single TEXT node bent along a path (Figma Draw "text on a path"). CSS
+ * can't curve text, so it must flatten into one SVG asset. The plugin marks it
+ * (svgExport); for REST payloads fall back to geometry — a straight text block
+ * is ~lines × lineHeight tall, while path text (a ring is roughly square) is
+ * far taller than any line count explains.
+ */
+function isCurvedTextNode(n: FigmaNode): boolean {
+  if (n.type !== "TEXT") return false;
+  if (n.svgExport) return true;
+  const box = n.absoluteBoundingBox;
+  const chars = n.characters ?? "";
+  if (!box || !box.width || !box.height || !chars) return false;
+  const fs = n.style?.fontSize ?? 14;
+  const lineH = fs * 1.5;
+  // Worst-case (largest) line-count estimate for box-width wrapping.
+  const perLine = Math.max(1, Math.floor(box.width / (fs * 0.55)));
+  let lines = 0;
+  for (const part of chars.split("\n"))
+    lines += Math.max(1, Math.ceil(part.length / perLine));
+  return box.height > Math.max(lineH, lines * lineH) * 2.2;
+}
+
+/**
+ * Text bent around a circle: each letter/word is its own rotated TEXT node.
+ * CSS has no text-on-path, so the only faithful output is one flattened SVG.
+ *
+ * The test must stay *tight*: a whole section that happens to contain a ringed
+ * chart label would otherwise collapse into a single image, taking every real
+ * heading and paragraph with it. So we demand the geometry of an actual ring —
+ * a roughly square box, short labels, and centres at a consistent radius.
+ */
+function isTextRing(n: FigmaNode): boolean {
+  const texts: FigmaNode[] = [];
+  (function walk(m: FigmaNode) {
+    if (m.type === "TEXT") texts.push(m);
+    for (const c of m.children ?? []) walk(c);
+  })(n);
+  // A ring is a flat bag of glyph/word layers. Anything whose children are
+  // frames is a section that merely *contains* a ring — flattening it would
+  // turn the whole layout into one picture.
+  const kids = n.children ?? [];
+  if (!kids.length || !kids.every((c) => c.type === "TEXT")) return false;
+  if (texts.length < 3 || texts.length > 80) return false;
+  const rotated = texts.filter((t) => Math.abs(t.rotation ?? 0) > 10);
+  if (rotated.length < texts.length * 0.6) return false;
+  // Ring labels are short — a wrapped paragraph that merely sits at an angle
+  // is still ordinary text.
+  if (rotated.some((t) => (t.characters ?? "").length > 40)) return false;
+  const box = n.absoluteBoundingBox;
+  if (!box || !box.width || !box.height) return false;
+  const aspect = box.width / box.height;
+  if (aspect < 0.5 || aspect > 2) return false;
+  // Every rotated label must sit at roughly the same distance from the centre.
+  const cx = box.x + box.width / 2;
+  const cy = box.y + box.height / 2;
+  const radii: number[] = [];
+  for (const t of rotated) {
+    const b = t.absoluteBoundingBox;
+    if (!b) return false;
+    const dx = b.x + b.width / 2 - cx;
+    const dy = b.y + b.height / 2 - cy;
+    radii.push(Math.sqrt(dx * dx + dy * dy));
+  }
+  const max = Math.max(...radii);
+  const min = Math.min(...radii);
+  return max > 0 && min >= max * 0.5;
+}
+
+/**
+ * A word laid out on a path: Figma splits it into one TEXT node per glyph.
+ * Rotation is no help — along a gentle arc each letter is tilted a degree or
+ * two — but no hand-built layout ever splits a word into single-character
+ * layers, so the shape of the children is the giveaway. Left as HTML it
+ * explodes into dozens of absolutely-positioned <p>s that never line up.
+ */
+function isSplitGlyphText(n: FigmaNode): boolean {
+  const kids = n.children ?? [];
+  if (kids.length < 5) return false;
+  if (!kids.every((c) => c.type === "TEXT")) return false;
+  const glyphs = kids.filter((c) => (c.characters ?? "").trim().length <= 2);
+  return glyphs.length >= kids.length * 0.8;
+}
+
+/** Does this container hold a mask layer (which clips its later siblings)? */
+function hasMaskedChild(n: FigmaNode): boolean {
+  return (n.children ?? []).some((c) => c.isMask);
+}
+
 function subtreeHasVector(n: FigmaNode): boolean {
   if (VECTOR_TYPES.has(n.type)) return true;
   return (n.children ?? []).some(subtreeHasVector);
@@ -203,19 +324,31 @@ function isArcEllipse(n: FigmaNode): boolean {
 function isIconNode(n: FigmaNode): boolean {
   if (VECTOR_TYPES.has(n.type)) return true;
   if (isArcEllipse(n)) return true;
-  // Honour an explicit "Export as SVG" mark from the designer — but never for a
-  // photo container (that would embed the raster and bloat the output).
-  if (n.svgExport && !hasImageFill(n)) return true;
   const container =
     n.type === "FRAME" ||
     n.type === "GROUP" ||
     n.type === "INSTANCE" ||
     n.type === "COMPONENT";
+  // Honour an explicit "Export as SVG" mark from the designer — but never for a
+  // photo container (that would embed the raster and bloat the output), and
+  // never for a container full of real text: designers routinely leave export
+  // settings on a whole section, and obeying that turns the section into one
+  // flat picture with no selectable text left.
+  if (n.svgExport && !hasImageFill(n) && !(container && subtreeHasRealText(n)))
+    return true;
   if (container && n.children?.length) {
     // A photo (image fill) is never an icon — flattening it to SVG embeds the
     // raster and bloats the code; let it become a background image instead.
     if (hasImageFill(n)) return false;
-    if (subtreeHasText(n)) return false;
+    // A vector mask (a country outline clipping a filled rectangle, say) has no
+    // CSS equivalent: rendered layer by layer it degrades into a solid block
+    // the size of the group. Flattening to one SVG is the only faithful output.
+    if (hasMaskedChild(n) && !subtreeHasRealText(n)) return true;
+    // Ordinary text keeps the container HTML; text bent along a path is the
+    // exception — split per glyph or ringed, it only survives flattened.
+    if (isSplitGlyphText(n)) return true;
+    if (subtreeHasText(n)) return isTextRing(n);
+
     if (!subtreeHasVector(n)) return false;
     // Vectors that each live in their own frame/group are separate icons (e.g.
     // a row of social icons) — keep them split so each stays its own asset,
@@ -233,17 +366,121 @@ function isIconNode(n: FigmaNode): boolean {
   return false;
 }
 
-function hasImageFill(n: FigmaNode): boolean {
-  return (n.fills ?? []).some(
-    (f) => f.visible !== false && f.type === "IMAGE",
-  );
+/**
+ * An image-like paint: a photo, or a video. CSS can't reproduce a Figma video
+ * fill, and the plugin's PNG export of such a node yields its first frame — so
+ * a video is treated exactly like a photo and lands as a still poster image.
+ */
+function isImagePaint(f: FigmaPaint): boolean {
+  return f.visible !== false && (f.type === "IMAGE" || f.type === "VIDEO");
 }
 
-/** scaleMode of the first visible image fill (FILL / FIT / TILE / CROP). */
+/** Does anything in this subtree paint a bitmap (photo / video fill)? */
+function subtreeHasImageFill(n: FigmaNode): boolean {
+  if (hasImageFill(n)) return true;
+  return (n.children ?? []).some(subtreeHasImageFill);
+}
+
+function hasImageFill(n: FigmaNode): boolean {
+  return (n.fills ?? []).some(isImagePaint);
+}
+
+/** True when the node's picture actually comes from a video fill (lossy: still). */
+function hasVideoFill(n: FigmaNode): boolean {
+  return (n.fills ?? []).some((f) => f.visible !== false && f.type === "VIDEO");
+}
+
+/** scaleMode of the first visible image/video fill (FILL / FIT / TILE / CROP). */
 function imageScaleMode(n: FigmaNode): string | undefined {
-  return (n.fills ?? []).find(
-    (f) => f.visible !== false && f.type === "IMAGE",
-  )?.scaleMode;
+  return (n.fills ?? []).find(isImagePaint)?.scaleMode;
+}
+
+// ---- Arc / donut segments ------------------------------------------------
+// Figma's partial ellipse has no CSS equivalent, and exporting it as an image
+// is worse than it looks: for a rotated node absoluteBoundingBox is the AABB of
+// the rotated *square*, while the rendered export is bounded by the drawn arc,
+// so the two never line up — stacked ring segments end up at different
+// diameters. We know the geometry exactly (centre, radii, angles, rotation), so
+// we draw the path ourselves and the chart lands pixel-accurate.
+
+/**
+ * Figma measures arc angles from 3 o'clock in the node's own y-down space, so
+ * they already run clockwise on screen — the same direction as SVG's y-down
+ * arcs — and the node's (already CSS-normalized, clockwise) rotation simply
+ * adds. Verified against a stacked donut whose four cumulative sectors all
+ * start at 12 o'clock and run clockwise: negating the angle instead put them
+ * at 6 o'clock and reversed the slice order.
+ */
+function arcShapes(node: FigmaNode, w: number, h: number): SvgShape[] | null {
+  const a = node.arcData;
+  if (!a) return null;
+  const fill = firstVisibleSolid(node.fills);
+  const stroke = firstVisibleSolid(node.strokes);
+  if (!fill && !stroke) return null;
+
+  const cx = w / 2;
+  const cy = h / 2;
+  const R = Math.min(cx, cy);
+  const Ri = R * Math.max(0, Math.min(1, a.innerRadius ?? 0));
+  const rot = ((node.rotation ?? 0) * Math.PI) / 180;
+  const a0 = a.startingAngle + rot;
+  const a1 = a.endingAngle + rot;
+  const sweep = a1 - a0;
+  const full = Math.abs(sweep) >= Math.PI * 2 - 0.001;
+
+  const pt = (ang: number, rad: number) =>
+    `${r(cx + rad * Math.cos(ang))} ${r(cy + rad * Math.sin(ang))}`;
+  const large = Math.abs(sweep) > Math.PI ? 1 : 0;
+  const dir = sweep >= 0 ? 1 : 0;
+
+  let d: string;
+  if (full && Ri > 0) {
+    // A closed ring: two circles wound in opposite directions punch the hole
+    // without relying on fill-rule (which JSX would need renamed).
+    d =
+      `M ${r(cx - R)} ${r(cy)} A ${r(R)} ${r(R)} 0 1 0 ${r(cx + R)} ${r(cy)} ` +
+      `A ${r(R)} ${r(R)} 0 1 0 ${r(cx - R)} ${r(cy)} Z ` +
+      `M ${r(cx - Ri)} ${r(cy)} A ${r(Ri)} ${r(Ri)} 0 1 1 ${r(cx + Ri)} ${r(cy)} ` +
+      `A ${r(Ri)} ${r(Ri)} 0 1 1 ${r(cx - Ri)} ${r(cy)} Z`;
+  } else if (full) {
+    d =
+      `M ${r(cx - R)} ${r(cy)} A ${r(R)} ${r(R)} 0 1 0 ${r(cx + R)} ${r(cy)} ` +
+      `A ${r(R)} ${r(R)} 0 1 0 ${r(cx - R)} ${r(cy)} Z`;
+  } else if (Ri > 0) {
+    // Figma's cornerRadius on a ring segment rounds its two ends — that is how
+    // a progress ring is drawn. Once the radius reaches half the ring's
+    // thickness the ends are fully round, which is exactly a stroked centreline
+    // with round caps; a filled sector would come out with blunt square ends.
+    const thickness = R - Ri;
+    if ((node.cornerRadius ?? 0) >= thickness / 2 - 0.5) {
+      const mid = (R + Ri) / 2;
+      return [
+        {
+          d: `M ${pt(a0, mid)} A ${r(mid)} ${r(mid)} 0 ${large} ${dir} ${pt(a1, mid)}`,
+          fill: "none",
+          stroke: fill ?? stroke ?? "none",
+          strokeWidth: r(thickness),
+          linecap: "round",
+        },
+      ];
+    }
+    d =
+      `M ${pt(a0, R)} A ${r(R)} ${r(R)} 0 ${large} ${dir} ${pt(a1, R)} ` +
+      `L ${pt(a1, Ri)} A ${r(Ri)} ${r(Ri)} 0 ${large} ${1 - dir} ${pt(a0, Ri)} Z`;
+  } else {
+    d =
+      `M ${r(cx)} ${r(cy)} L ${pt(a0, R)} ` +
+      `A ${r(R)} ${r(R)} 0 ${large} ${dir} ${pt(a1, R)} Z`;
+  }
+
+  const shape: SvgShape = { d, fill: fill ?? "none" };
+  if (stroke) {
+    shape.stroke = stroke;
+    // Figma's INSIDE alignment has no SVG equivalent; a centred stroke of the
+    // same weight is within half a pixel on a ring this size.
+    shape.strokeWidth = r(node.strokeWeight ?? 1);
+  }
+  return [shape];
 }
 
 // ---- Semantic tag inference (button / h1-h6 / a) --------------------------
@@ -303,9 +540,14 @@ function collectTextSizes(n: FigmaNode, acc: Set<number>): void {
 
 /** Map a text node to a heading level by explicit name or font size. */
 function headingTag(n: FigmaNode, sizes?: number[]): IRTag | null {
+  // The shared text style ("Heading/H1") is the designer's own declaration of
+  // level - trust it over the layer name, which is often just the copy itself.
+  const styleName = n.style?.textStyleName ?? "";
+  const sm = /\bh([1-6])\b/i.exec(styleName);
+  if (sm) return (`h${sm[1]}` as IRTag);
   const m = /\bh([1-6])\b/i.exec(n.name);
   if (m) return (`h${m[1]}` as IRTag);
-  const named = /\b(heading|headline|title|заголовок)\b/i.test(n.name);
+  const named = /\b(heading|headline|title|заголовок)\b/i.test(`${n.name} ${styleName}`);
   const size = n.style?.fontSize ?? 0;
   if (named) return size >= 30 ? "h1" : "h2";
   if (size >= 36) return "h1";
@@ -322,6 +564,51 @@ function headingTag(n: FigmaNode, sizes?: number[]): IRTag | null {
 }
 
 const r = (n: number) => Math.round(n);
+
+/**
+ * How the layer is composited: opacity, shadows, blur, blend mode, and its
+ * place in the stack. These apply to an exported <img> exactly as they do to a
+ * <div>, so they must be emitted before the asset short-circuit — a map layer
+ * at 73% opacity in DIFFERENCE mode with an 18px blur otherwise lands as a
+ * plain, fully opaque picture.
+ */
+function compositingClasses(node: FigmaNode): string[] {
+  const cls: string[] = [];
+  if (node.opacity != null && node.opacity < 1)
+    cls.push(`opacity-[${+node.opacity.toFixed(2)}]`);
+
+  // A background layer kept out of the flow paints behind its siblings.
+  if (node.bgLayer) cls.push("-z-10");
+
+  // All drop/inner shadows, comma-joined like CSS.
+  const shadows = (node.effects ?? []).filter(
+    (e) =>
+      e.visible !== false &&
+      (e.type === "DROP_SHADOW" || e.type === "INNER_SHADOW") &&
+      e.offset &&
+      e.color,
+  );
+  if (shadows.length) {
+    const parts = shadows.map((sh) => {
+      const inset = sh.type === "INNER_SHADOW" ? "inset_" : "";
+      return `${inset}${r(sh.offset!.x)}px_${r(sh.offset!.y)}px_${r(sh.radius ?? 0)}px_${r(sh.spread ?? 0)}px_${colorToHex(sh.color!).replace(/\s/g, "")}`;
+    });
+    cls.push(`shadow-[${parts.join(",")}]`);
+  }
+
+  const layerBlur = (node.effects ?? []).find(
+    (e) => e.visible !== false && e.type === "LAYER_BLUR" && (e.radius ?? 0) > 0,
+  );
+  const bgBlur = (node.effects ?? []).find(
+    (e) => e.visible !== false && e.type === "BACKGROUND_BLUR" && (e.radius ?? 0) > 0,
+  );
+  if (layerBlur) cls.push(`blur-[${r(layerBlur.radius ?? 0)}px]`);
+  if (bgBlur) cls.push(`backdrop-blur-[${r(bgBlur.radius ?? 0)}px]`);
+
+  const blend = blendClass(node.blendMode);
+  if (blend) cls.push(blend);
+  return cls;
+}
 
 /** Figma blend mode → Tailwind mix-blend utility (NORMAL / PASS_THROUGH → none). */
 function blendClass(mode?: string): string | null {
@@ -377,29 +664,117 @@ function firstSolidPaint(
   return null;
 }
 
-function gradientCss(p: FigmaPaint): string | null {
-  if (!p.gradientStops?.length) return null;
-  const stops = p.gradientStops
-    .map((s) => `${colorToHex(s.color)} ${r(s.position * 100)}%`)
-    .join(", ");
-  if (p.type === "GRADIENT_RADIAL") {
-    // Position/size the ellipse from Figma's handles: [0] centre, [1] end of the
-    // horizontal radius, [2] end of the vertical radius (all normalised 0–1 to
-    // the box). Without handles fall back to a centred circle.
-    const h = p.gradientHandlePositions;
-    if (h && h.length >= 3) {
-      const cx = r(h[0].x * 100);
-      const cy = r(h[0].y * 100);
-      const rx = r(Math.hypot(h[1].x - h[0].x, h[1].y - h[0].y) * 100);
-      const ry = r(Math.hypot(h[2].x - h[0].x, h[2].y - h[0].y) * 100);
-      return `radial-gradient(ellipse ${rx}% ${ry}% at ${cx}% ${cy}%, ${stops})`;
-    }
-    return `radial-gradient(circle, ${stops})`;
+/** Colour of one gradient stop, with the paint-level opacity folded in. */
+function stopColor(c: FigmaColor, paintOpacity: number): string {
+  const a = (c.a ?? 1) * paintOpacity;
+  return colorToHex({ ...c, a });
+}
+
+/**
+ * Figma's gradient handles are normalised to the node's box (0–1 on each
+ * axis), so a vector that looks like 45° in that space is *not* 45° on screen
+ * unless the box is square. Converting to pixels first is what makes the
+ * direction match Figma on wide/tall nodes.
+ */
+function handlePx(
+  h: { x: number; y: number },
+  w: number,
+  ht: number,
+): { x: number; y: number } {
+  return { x: h.x * w, y: h.y * ht };
+}
+
+/**
+ * A Figma linear gradient runs between two arbitrary points; CSS runs it along
+ * a line through the box centre whose length is the box's projection onto that
+ * angle. Same angle, different extent — so the stop offsets have to be remapped
+ * onto the CSS gradient line or the colours land in the wrong place (the usual
+ * "the gradient is right but shifted/stretched" complaint).
+ */
+function linearGradientCss(
+  p: FigmaPaint,
+  stops: { position: number; color: string }[],
+  w: number,
+  h: number,
+): string {
+  const hp = p.gradientHandlePositions;
+  if (!hp || hp.length < 2 || !w || !h) {
+    const angle = p.gradientAngle != null ? r(p.gradientAngle) : 180;
+    const list = stops.map((s) => `${s.color} ${r(s.position * 100)}%`).join(", ");
+    return `linear-gradient(${angle}deg, ${list})`;
   }
-  // Prefer the real gradient angle (plugin computes it from the handle
-  // positions); fall back to top-to-bottom for REST payloads that lack it.
-  const angle = p.gradientAngle != null ? r(p.gradientAngle) : 180;
-  return `linear-gradient(${angle}deg, ${stops})`;
+  const p0 = handlePx(hp[0], w, h);
+  const p1 = handlePx(hp[1], w, h);
+  const dx = p1.x - p0.x;
+  const dy = p1.y - p0.y;
+  // CSS 0deg points up and grows clockwise; Figma's y axis grows downward.
+  let deg = (Math.atan2(dx, -dy) * 180) / Math.PI;
+  deg = ((deg % 360) + 360) % 360;
+  const rad = (deg * Math.PI) / 180;
+  // Unit vector of the CSS gradient line and its length for this box.
+  const ux = Math.sin(rad);
+  const uy = -Math.cos(rad);
+  const len = Math.abs(w * ux) + Math.abs(h * uy);
+  if (!len) return `linear-gradient(${r(deg)}deg, ${stops.map((s) => s.color).join(", ")})`;
+  const cx = w / 2;
+  const cy = h / 2;
+  const proj = (q: { x: number; y: number }) =>
+    ((q.x - cx) * ux + (q.y - cy) * uy + len / 2) / len;
+  const a = proj(p0);
+  const b = proj(p1);
+  const list = stops
+    .map((s) => `${s.color} ${r((a + s.position * (b - a)) * 100)}%`)
+    .join(", ");
+  return `linear-gradient(${r(deg)}deg, ${list})`;
+}
+
+function gradientCss(p: FigmaPaint, w = 0, h = 0): string | null {
+  if (!p.gradientStops?.length) return null;
+  const paintOpacity = p.opacity ?? 1;
+  const stops = p.gradientStops.map((s) => ({
+    position: s.position,
+    color: stopColor(s.color, paintOpacity),
+  }));
+  const list = stops.map((s) => `${s.color} ${r(s.position * 100)}%`).join(", ");
+  const hp = p.gradientHandlePositions;
+
+  if (p.type === "GRADIENT_RADIAL" || p.type === "GRADIENT_DIAMOND") {
+    // Handles: [0] centre, [1] end of the horizontal radius, [2] end of the
+    // vertical radius — all normalised to the box, so each radius has to be
+    // measured in pixels and then expressed against its own axis.
+    if (hp && hp.length >= 3 && w && h) {
+      const c = handlePx(hp[0], w, h);
+      const e1 = handlePx(hp[1], w, h);
+      const e2 = handlePx(hp[2], w, h);
+      const rx = Math.hypot(e1.x - c.x, e1.y - c.y);
+      const ry = Math.hypot(e2.x - c.x, e2.y - c.y);
+      const cxp = r((c.x / w) * 100);
+      const cyp = r((c.y / h) * 100);
+      return `radial-gradient(ellipse ${r((rx / w) * 100)}% ${r((ry / h) * 100)}% at ${cxp}% ${cyp}%, ${list})`;
+    }
+    return `radial-gradient(circle, ${list})`;
+  }
+
+  if (p.type === "GRADIENT_ANGULAR") {
+    // An angular sweep *is* a conic gradient — no approximation needed.
+    let from = 0;
+    let cxp = 50;
+    let cyp = 50;
+    if (hp && hp.length >= 2 && w && h) {
+      const c = handlePx(hp[0], w, h);
+      const e = handlePx(hp[1], w, h);
+      const deg = (Math.atan2(e.x - c.x, -(e.y - c.y)) * 180) / Math.PI;
+      from = r(((deg % 360) + 360) % 360);
+      cxp = r((c.x / w) * 100);
+      cyp = r((c.y / h) * 100);
+    }
+    const conic = stops
+      .map((s) => `${s.color} ${r(s.position * 360)}deg`)
+      .join(", ");
+    return `conic-gradient(from ${from}deg at ${cxp}% ${cyp}%, ${conic})`;
+  }
+
+  return linearGradientCss(p, stops, w, h);
 }
 
 function bbox(n: FigmaNode): FigmaRect | undefined {
@@ -415,7 +790,11 @@ function bbox(n: FigmaNode): FigmaRect | undefined {
  * calculateRectangleFromBoundingBox. `cssRotationDeg` is already clockwise
  * (the plugin negates Figma's counter-clockwise value).
  */
-function unrotatedRect(box: FigmaRect, cssRotationDeg: number): FigmaRect {
+function unrotatedRect(
+  box: FigmaRect,
+  cssRotationDeg: number,
+  size?: { x: number; y: number },
+): FigmaRect {
   const theta = (cssRotationDeg * Math.PI) / 180;
   const ac = Math.abs(Math.cos(theta));
   const as = Math.abs(Math.sin(theta));
@@ -423,9 +802,25 @@ function unrotatedRect(box: FigmaRect, cssRotationDeg: number): FigmaRect {
   //   Wb = w·|cos| + h·|sin|,  Hb = w·|sin| + h·|cos|.
   // Solve for w,h. denom = |cos|²−|sin|² vanishes only near 45° (singular).
   const denom = ac * ac - as * as;
-  if (Math.abs(denom) < 1e-4) return box;
-  const w = (box.width * ac - box.height * as) / denom;
-  const h = (box.height * ac - box.width * as) / denom;
+  let w: number;
+  let h: number;
+  if (size && size.x > 0 && size.y > 0) {
+    // Exact size straight off the node — no inversion needed.
+    w = size.x;
+    h = size.y;
+  } else if (Math.abs(denom) < 1e-4) {
+    // Singular at ~45°, except for a square: there w = h, so the AABB gives
+    // Wb = w·(|cos|+|sin|) — one equation, one unknown. A donut ring turned 45°
+    // is exactly this case, and without it the circle inflates by √2.
+    if (Math.abs(box.width - box.height) > 1) return box;
+    const side = box.width / (ac + as);
+    if (!(side > 0)) return box;
+    w = side;
+    h = side;
+  } else {
+    w = (box.width * ac - box.height * as) / denom;
+    h = (box.height * ac - box.width * as) / denom;
+  }
   if (!(w > 0) || !(h > 0)) return box;
   // The un-rotated rectangle shares the AABB's centre (CSS rotate() spins around
   // the centre), so recover the top-left from the size difference.
@@ -435,6 +830,251 @@ function unrotatedRect(box: FigmaRect, cssRotationDeg: number): FigmaRect {
     width: r(w),
     height: r(h),
   };
+}
+
+// ---- Geometric flow detection (free-form frame → flex row/column/grid) -----
+// Figma's own inferredAutoLayout only recognises a single clean row or column,
+// so a repeated grid of cards (2×3, 3×4, …) always falls through to absolute
+// left/top soup. This recovers the common cases — a uniform row, column, or
+// grid — from the children's geometry so we can emit flex / flex-wrap instead.
+
+interface InferredFlow {
+  layoutMode: "HORIZONTAL" | "VERTICAL";
+  /** primary-axis gap (between columns in a grid/row) */
+  itemSpacing: number;
+  /** true for a grid: wrap the row so it breaks into multiple lines */
+  wrap?: boolean;
+  /** cross-axis gap between grid rows */
+  counterSpacing?: number;
+  /** inset of the flow content from the frame edges (from the child geometry) */
+  paddingLeft: number;
+  paddingTop: number;
+  paddingRight: number;
+  paddingBottom: number;
+  /** full child render order: absolute background layers first, then the flow */
+  children: FigmaNode[];
+  /** a full-bleed background leaf whose fill/radius/stroke/shadow should be
+   *  folded into the container itself (the idiomatic form) instead of kept as a
+   *  separate absolute layer. */
+  mergeBackground?: FigmaNode;
+}
+
+/** Any visible paint (solid / gradient / image) that fills the node's box. */
+function hasVisibleFill(n: FigmaNode): boolean {
+  return (n.fills ?? []).some(
+    (f) =>
+      f.visible !== false &&
+      (f.type === "SOLID" || f.type.startsWith("GRADIENT") || isImagePaint(f)),
+  );
+}
+
+/** Fraction of the smaller box's area covered by the intersection (0–1). */
+function areaOverlap(a: FigmaRect, b: FigmaRect): number {
+  const w = Math.max(0, Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x));
+  const h = Math.max(0, Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y));
+  const min = Math.min(a.width * a.height, b.width * b.height);
+  return min > 0 ? (w * h) / min : 0;
+}
+
+/** Vertical overlap (px) of two boxes — the test for "same row". */
+function vOverlap(a: FigmaRect, b: FigmaRect): number {
+  return Math.max(0, Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y));
+}
+
+/** Average of `gaps` when they're all within tolerance and none is a real
+ *  overlap (< -2px); otherwise null (the spacing isn't a clean, uniform flow). */
+function uniformGap(gaps: number[]): number | null {
+  if (!gaps.length) return null;
+  const min = Math.min(...gaps);
+  const max = Math.max(...gaps);
+  if (min < -2) return null;
+  const avg = gaps.reduce((s, g) => s + g, 0) / gaps.length;
+  const tol = Math.max(4, Math.abs(avg) * 0.15);
+  if (max - min > tol) return null;
+  return Math.max(0, avg);
+}
+
+/** True when every value is within `tol` of the first (columns/widths align). */
+function allClose(values: number[], tol = 3): boolean {
+  return values.every((v) => Math.abs(v - values[0]) <= tol);
+}
+
+/**
+ * Detect a uniform row / column / grid among a free-form frame's children from
+ * their bounding boxes. Returns a synthetic auto-layout description the existing
+ * flex path can consume, or null when the children don't cleanly flow (they
+ * overlap, or the spacing is irregular) — in which case absolute wins.
+ */
+function inferFlowLayout(node: FigmaNode): InferredFlow | null {
+  const pbox = node.absoluteBoundingBox;
+  const box = (c: FigmaNode) => c.absoluteBoundingBox!;
+  const visible = (node.children ?? []).filter(
+    (c) =>
+      c.visible !== false &&
+      c.absoluteBoundingBox &&
+      c.layoutPositioning !== "ABSOLUTE",
+  );
+
+  // A full-bleed background layer (a rectangle covering ~all of the frame) is a
+  // decorative sibling, not part of the flow — set it aside as an absolute layer
+  // so header/grid siblings can still be detected as a clean row/column/grid.
+  const parentArea = pbox ? pbox.width * pbox.height : 0;
+  const backgrounds = visible.filter(
+    (c) => parentArea > 0 && box(c).width * box(c).height >= parentArea * 0.9,
+  );
+  const kids = visible.filter((c) => !backgrounds.includes(c));
+  // Attempt only when there were extra siblings to justify the guess.
+  if (kids.length < 2) return null;
+  if (backgrounds.length === 0 && kids.length < 3) return null;
+
+  // Overlapping children are free-form art / stacked layers, not a flow.
+  for (let i = 0; i < kids.length; i++)
+    for (let j = i + 1; j < kids.length; j++)
+      if (areaOverlap(box(kids[i]), box(kids[j])) > 0.25) return null;
+
+  // Content inset from the frame edges → the container's padding.
+  const minX = Math.min(...kids.map((c) => box(c).x));
+  const minY = Math.min(...kids.map((c) => box(c).y));
+  const maxX = Math.max(...kids.map((c) => box(c).x + box(c).width));
+  const maxY = Math.max(...kids.map((c) => box(c).y + box(c).height));
+  const pad = pbox
+    ? {
+        paddingLeft: Math.max(0, minX - pbox.x),
+        paddingTop: Math.max(0, minY - pbox.y),
+        paddingRight: Math.max(0, pbox.x + pbox.width - maxX),
+        paddingBottom: Math.max(0, pbox.y + pbox.height - maxY),
+      }
+    : { paddingLeft: 0, paddingTop: 0, paddingRight: 0, paddingBottom: 0 };
+  // The idiomatic form: a single full-bleed background rectangle IS the
+  // container's background — fold its fill/radius/stroke/shadow into the parent
+  // and drop the element, but only when the parent has no fill of its own and
+  // the layer is a plain, opaque, unrotated leaf (a genuine backdrop).
+  let mergeBackground: FigmaNode | undefined;
+  let overlays = backgrounds;
+  if (
+    backgrounds.length === 1 &&
+    !hasVisibleFill(node) &&
+    !(backgrounds[0].children?.length) &&
+    (backgrounds[0].opacity ?? 1) >= 1 &&
+    !(backgrounds[0].rotation && Math.abs(backgrounds[0].rotation) > 0.5) &&
+    pbox &&
+    box(backgrounds[0]).width * box(backgrounds[0]).height >= parentArea * 0.98
+  ) {
+    mergeBackground = backgrounds[0];
+    overlays = [];
+  }
+  // Any remaining background layers stay as absolute overlays, pushed behind the
+  // now-in-flow siblings (bgLayer → -z-10 on the container's isolated context).
+  const bg = overlays.map(
+    (c) => ({ ...c, layoutPositioning: "ABSOLUTE", bgLayer: true }) as FigmaNode,
+  );
+  // Fields shared by every successful return: padding + the merge candidate.
+  const extra = { ...pad, mergeBackground };
+  const flow = (order: FigmaNode[]): InferredFlow["children"] => [...bg, ...order];
+
+  // Cluster into rows: a child joins a row when it overlaps it vertically.
+  const byTop = [...kids].sort((a, b) => box(a).y - box(b).y);
+  const rows: FigmaNode[][] = [];
+  for (const k of byTop) {
+    const kb = box(k);
+    const row = rows.find((rr) => {
+      const rb = box(rr[0]);
+      return vOverlap(kb, rb) > 0.5 * Math.min(kb.height, rb.height);
+    });
+    if (row) row.push(k);
+    else rows.push([k]);
+  }
+  for (const rr of rows) rr.sort((a, b) => box(a).x - box(b).x);
+
+  const horizGaps = (row: FigmaNode[]): number | null => {
+    const g: number[] = [];
+    for (let i = 1; i < row.length; i++)
+      g.push(box(row[i]).x - (box(row[i - 1]).x + box(row[i - 1]).width));
+    return uniformGap(g);
+  };
+
+  const cols = rows[0].length;
+
+  // ---- Grid: >1 row, every row the same width, columns & widths aligned ----
+  if (rows.length > 1 && cols > 1 && rows.every((rr) => rr.length === cols)) {
+    const colGaps = rows.map(horizGaps);
+    const colStarts = rows.map((rr) => rr.map((c) => box(c).x));
+    const widths = kids.map((c) => box(c).width);
+    const columnsAligned = Array.from({ length: cols }).every((_, j) =>
+      allClose(colStarts.map((s) => s[j])),
+    );
+    const rowTops = rows.map((rr) => Math.min(...rr.map((c) => box(c).y)));
+    const rowBots = rows.map((rr) => Math.max(...rr.map((c) => box(c).y + box(c).height)));
+    const rowGaps: number[] = [];
+    for (let i = 1; i < rows.length; i++) rowGaps.push(rowTops[i] - rowBots[i - 1]);
+    const colGap = uniformGap(colGaps.filter((g): g is number => g != null));
+    const rowGap = uniformGap(rowGaps);
+    if (
+      colGap != null &&
+      rowGap != null &&
+      columnsAligned &&
+      allClose(widths, Math.max(4, widths[0] * 0.1)) &&
+      colGaps.every((g) => g != null)
+    ) {
+      return {
+        layoutMode: "HORIZONTAL",
+        itemSpacing: colGap,
+        wrap: true,
+        counterSpacing: rowGap,
+        ...extra,
+        children: flow(rows.flat()),
+      };
+    }
+    return null;
+  }
+
+  // ---- Single row ----
+  if (rows.length === 1) {
+    const g = horizGaps(rows[0]);
+    if (g != null)
+      return { layoutMode: "HORIZONTAL", itemSpacing: g, ...extra, children: flow(rows[0]) };
+    return null;
+  }
+
+  // ---- Single column (every row holds exactly one item) ----
+  if (rows.every((rr) => rr.length === 1)) {
+    const tops = rows.map((rr) => box(rr[0]).y);
+    const bots = rows.map((rr) => box(rr[0]).y + box(rr[0]).height);
+    const g: number[] = [];
+    for (let i = 1; i < rows.length; i++) g.push(tops[i] - bots[i - 1]);
+    const gap = uniformGap(g);
+    if (gap != null)
+      return { layoutMode: "VERTICAL", itemSpacing: gap, ...extra, children: flow(rows.flat()) };
+  }
+  return null;
+}
+
+/**
+ * A rotated container whose rotation must not be re-applied in CSS.
+ *
+ * Figma stores a node's rotation relative to its parent but its bounding box in
+ * absolute (already rotated) coordinates. Wherever we pin children by those
+ * boxes, the parent's turn is baked into the numbers, so wrapping them in a
+ * `rotate()` turns everything twice. That covers two shapes of layer:
+ *
+ *  - a free-form rotated group: its children get absolute left/top;
+ *  - a frame whose rotation every child undoes (net zero on screen): Figma lays
+ *    it out in its own turned space, which CSS cannot do because `rotate()`
+ *    does not affect layout — flex would size the children along the wrong axis
+ *    and scatter them outside the frame.
+ *
+ * An ordinary rotated auto-layout frame is *not* included: its children flow in
+ * the frame's local space, which `rotate()` reproduces correctly.
+ */
+function flattensRotation(node: FigmaNode, opts: ConvertOptions): boolean {
+  const rot = node.rotation ?? 0;
+  if (Math.abs(rot) < 0.5) return false;
+  const kids = node.children ?? [];
+  if (!kids.length) return false;
+  // Every child undoes the rotation → the frame only looks turned in Figma.
+  if (kids.every((c) => Math.abs((c.rotation ?? 0) + rot) < 1)) return true;
+  // Otherwise only when the children are about to be pinned by their boxes.
+  return !!opts.absolutePositioning && (!node.layoutMode || node.layoutMode === "NONE");
 }
 
 /** Record a non-fatal conversion note (deduped later). */
@@ -460,12 +1100,47 @@ function nodeToIR(
     // component identifiers than an anonymous "Frame 12".
     name: node.componentName || node.name,
   };
+  // A rotated container whose children are placed by their absolute boxes: the
+  // turn is already baked into those coordinates, so we drop it here and fold
+  // it into the children (Figma stores their rotation relative to the parent).
+  // See flattensRotation.
+  if (flattensRotation(node, opts)) {
+    node = {
+      ...node,
+      rotation: 0,
+      layoutMode: "NONE",
+      inferredLayout: undefined,
+      // Its children are about to be pinned absolutely, so there is no longer
+      // any flow content to hug — a hug-sized frame would collapse to nothing
+      // and its text would spill out. Pin it to the size it actually occupies.
+      layoutSizingHorizontal:
+        node.layoutSizingHorizontal === "HUG" ? "FIXED" : node.layoutSizingHorizontal,
+      layoutSizingVertical:
+        node.layoutSizingVertical === "HUG" ? "FIXED" : node.layoutSizingVertical,
+      primaryAxisSizingMode: "FIXED",
+      counterAxisSizingMode: "FIXED",
+      children: node.children!.map((c) => ({
+        ...c,
+        rotation: (c.rotation ?? 0) + (node.rotation ?? 0),
+      })),
+    };
+  }
+
+  // A rotated child breaks every flow inference: Figma reads its rotated
+  // bounding box (a chart's y-axis caption is tall and narrow, sitting to the
+  // left of everything), but in CSS `rotate()` does not affect layout, so the
+  // element still takes up its wide, short unrotated box and lands somewhere
+  // else entirely — the two axis captions swap places. Pin such a frame's
+  // children by their real boxes instead.
+  const flowable = !(node.children ?? []).some((c) => Math.abs(c.rotation ?? 0) >= 0.5);
+
   // Opt-in: adopt Figma's inferred auto-layout for a free-form frame so the
   // existing auto-layout→flex path fires (children flow instead of being pinned
   // with absolute left/top). Children are sorted along the primary axis because
   // Figma's children array is in z-order, not visual order.
   if (
     opts.inferLayout &&
+    flowable &&
     node.inferredLayout &&
     (!node.layoutMode || node.layoutMode === "NONE") &&
     node.children &&
@@ -491,18 +1166,74 @@ function nodeToIR(
       counterAxisAlignItems: il.counterAxisAlignItems,
       children: sorted,
     };
+  } else if (
+    // No inferred layout from Figma (it only spots single-axis flows) — recover
+    // a uniform row / column / grid from the children's geometry ourselves.
+    opts.inferLayout &&
+    flowable &&
+    (!node.layoutMode || node.layoutMode === "NONE") &&
+    node.children &&
+    node.children.length > 2
+  ) {
+    const flow = inferFlowLayout(node);
+    if (flow) {
+      node = {
+        ...node,
+        layoutMode: flow.layoutMode,
+        itemSpacing: flow.itemSpacing,
+        layoutWrap: flow.wrap ? "WRAP" : node.layoutWrap,
+        counterAxisSpacing: flow.counterSpacing,
+        paddingLeft: flow.paddingLeft,
+        paddingRight: flow.paddingRight,
+        paddingTop: flow.paddingTop,
+        paddingBottom: flow.paddingBottom,
+        children: flow.children,
+      };
+      // Fold a full-bleed background leaf into the container itself (fill /
+      // radius / stroke / shadow) — the way a developer would write it, instead
+      // of leaving a separate absolute layer behind everything.
+      const b = flow.mergeBackground;
+      if (b) {
+        node = {
+          ...node,
+          fills: b.fills,
+          cornerRadius: b.cornerRadius,
+          cornerRadiusVar: b.cornerRadiusVar,
+          rectangleCornerRadii: b.rectangleCornerRadii,
+          strokes: b.strokes,
+          strokeWeight: b.strokeWeight,
+          strokeAlign: b.strokeAlign,
+          strokeDashes: b.strokeDashes,
+          individualStrokeWeights: b.individualStrokeWeights,
+          effects: node.effects ?? b.effects,
+        };
+      }
+    }
   }
 
   const cls = el.classes;
   const box = bbox(node);
-  // For a rotated node, position & size come from the un-rotated rectangle
-  // (see unrotatedRect); `rotate()` is emitted separately below. Non-rotated
-  // nodes use the bounding box unchanged.
   const rotDeg = node.rotation && Math.abs(node.rotation) > 0.5 ? node.rotation : 0;
-  const geo = box && rotDeg ? unrotatedRect(box, rotDeg) : box;
-  // unrotatedRect returns the AABB unchanged near ~45° (singular) — position
-  // may be slightly off there; note it rather than fail silently.
-  if (geo && box && rotDeg && geo.width === box.width && geo.height === box.height)
+
+  // An exported node (icon / photo) is rendered by Figma *as it appears*, so the
+  // picture already carries the rotation and its frame is the rotated bounding
+  // box. Sizing such an <img> by the un-rotated rectangle turns a vertical grid
+  // line — a horizontal LINE turned 90° — back into a horizontal one 369px
+  // wide, which then blows the column it sits in wide open.
+  const isTextNode = node.type === "TEXT";
+  // A partial ellipse is the exception: we draw it ourselves (see arcShapes)
+  // from the un-rotated circle, folding the rotation into the path's angles.
+  const exported =
+    !isArcEllipse(node) &&
+    ((isTextNode ? isCurvedTextNode(node) : isIconNode(node)) ||
+      (!isTextNode && hasImageFill(node) && !node.children?.length));
+
+  // Everything else keeps its un-rotated rectangle and gets a `rotate()` below.
+  const geo = box && rotDeg && !exported ? unrotatedRect(box, rotDeg, node.size) : box;
+  // unrotatedRect returns the AABB unchanged when it can't invert the rotation
+  // (a non-square node at ~45°, with no exact size from the plugin) — position
+  // and size may be off there; note it rather than fail silently.
+  if (!exported && geo && box && rotDeg && geo.width === box.width && geo.height === box.height)
     warn(opts, node, `rotation near 45° — position approximated`);
 
   // Component boolean / instance-swap properties (JSX only) — set early so they
@@ -518,6 +1249,9 @@ function nodeToIR(
   }
 
   const isText = node.type === "TEXT";
+  // Curved (path) text skips the text pipeline entirely: it becomes an <img>
+  // like an icon, and — unlike straight text — needs its w/h emitted.
+  const curvedText = isText && isCurvedTextNode(node);
   const isAutoLayout = node.layoutMode === "HORIZONTAL" || node.layoutMode === "VERTICAL";
   const parentAuto = parent?.layoutMode === "HORIZONTAL" || parent?.layoutMode === "VERTICAL";
 
@@ -587,7 +1321,17 @@ function nodeToIR(
     cls.push("flex");
     if (node.layoutMode === "VERTICAL") cls.push("flex-col");
     if (node.layoutWrap === "WRAP") cls.push("flex-wrap");
-    if (node.itemSpacing)
+    // A wrapped grid can have different column vs row gaps → gap-x / gap-y;
+    // otherwise the single `gap` shorthand (or its variable token).
+    const cross = node.counterAxisSpacing;
+    if (
+      node.layoutWrap === "WRAP" &&
+      cross != null &&
+      r(cross) !== r(node.itemSpacing ?? 0)
+    ) {
+      if (node.itemSpacing) cls.push(`gap-x-[${r(node.itemSpacing)}px]`);
+      if (cross) cls.push(`gap-y-[${r(cross)}px]`);
+    } else if (node.itemSpacing)
       cls.push(node.itemSpacingVar ? `gap-${node.itemSpacingVar}` : `gap-[${r(node.itemSpacing)}px]`);
 
     const pl = r(node.paddingLeft ?? 0);
@@ -623,7 +1367,14 @@ function nodeToIR(
       }
     }
 
-    const justify = axisToJustify(node.primaryAxisAlignItems);
+    // Figma clips an overflowing auto-layout frame at its far edge whatever the
+    // alignment says; CSS instead pushes the excess out of the *near* edge,
+    // where `overflow: hidden` makes it unreachable — the first column of a
+    // too-wide table disappears off the left. Fall back to start alignment,
+    // which is what the frame actually looks like.
+    const justify = overflowsPrimaryAxis(node)
+      ? null
+      : axisToJustify(node.primaryAxisAlignItems);
     if (justify) cls.push(justify);
     const align = axisToAlign(node.counterAxisAlignItems);
     if (align) cls.push(align);
@@ -631,6 +1382,9 @@ function nodeToIR(
     // Containing block for layoutPositioning:"ABSOLUTE" children.
     if ((node.children ?? []).some((c) => c.layoutPositioning === "ABSOLUTE"))
       cls.push("relative");
+    // A background layer sits at -z-10; isolate keeps that stacking local so it
+    // paints behind the in-flow siblings without slipping under outer content.
+    if ((node.children ?? []).some((c) => c.bgLayer)) cls.push("isolate");
   }
 
   // ---- Size ----
@@ -651,8 +1405,12 @@ function nodeToIR(
         (rowParent
           ? node.layoutAlign === "STRETCH"
           : (node.layoutGrow ?? 0) > 0)));
-  if (fillW) cls.push(rowParent ? "grow" : "w-full");
-  if (fillH) cls.push(rowParent ? "self-stretch" : "grow");
+  // Figma's FILL splits the main axis evenly, so the CSS needs a zero basis:
+  // plain `grow` distributes only the *leftover* space around each item's
+  // content, which makes text-heavy cards wider than their siblings — and under
+  // flex-wrap it sizes them by max-content and wraps instead of sharing.
+  if (fillW) cls.push(...(rowParent ? ["grow", "basis-0"] : ["w-full"]));
+  if (fillH) cls.push(...(rowParent ? ["self-stretch"] : ["grow", "basis-0"]));
 
   // Figma never shrinks an item below its size unless it's set to "Fill" along
   // the layout axis; CSS flex items shrink by default (flex-shrink: 1). Without
@@ -663,11 +1421,15 @@ function nodeToIR(
     if (!mainAxisFill) cls.push("shrink-0");
   }
 
-  if (geo && !isText) {
-    // A LINE (or a stroke-only divider) has a zero-height/width box; fall
-    // back to the stroke weight so it doesn't collapse to h-[0px].
-    const w = geo.width || node.strokeWeight || 1;
-    const h = geo.height || node.strokeWeight || 1;
+  if (geo && (!isText || curvedText)) {
+    // A LINE (or a stroke-only divider) has a zero-height/width box; fall back
+    // to the stroke weight so it doesn't collapse to h-[0px]. The test has to
+    // be sub-pixel, not "=== 0": rotating a line leaves floating-point dust
+    // (1e-13) in the bounding box, which is truthy and then rounds to nothing —
+    // a vertical grid line silently disappears.
+    const hairline = (v: number) => v < 0.5;
+    const w = hairline(geo.width) ? node.strokeWeight || 1 : geo.width;
+    const h = hairline(geo.height) ? node.strokeWeight || 1 : geo.height;
     const hugW =
       node.layoutSizingHorizontal === "HUG" ||
       (isAutoLayout &&
@@ -691,23 +1453,68 @@ function nodeToIR(
   if (node.minHeight != null) cls.push(`min-h-[${r(node.minHeight)}px]`);
   if (node.maxHeight != null) cls.push(`max-h-[${r(node.maxHeight)}px]`);
 
-  // ---- Ellipse → circle (before asset export so a photo-in-circle <img>
-  // keeps the clipping class too) ----
-  if (node.type === "ELLIPSE" && !isArcEllipse(node)) cls.push("rounded-full");
+  // ---- Corner rounding ----
+  // Must precede the asset export below: an exported <img> (photo / video /
+  // icon) returns early, so a radius emitted after it would be dropped and the
+  // picture would render with square corners. Rounding is a pure CSS clip, so
+  // it stays correct even when the exported asset already has the corners cut.
+  // On a partial ellipse cornerRadius rounds the arc's ends (handled by
+  // arcShapes), not the element's box — emitting it as border-radius would clip
+  // the drawing instead.
+  if (isArcEllipse(node)) {
+    /* nothing: see arcShapes */
+  } else if (node.type === "ELLIPSE") cls.push("rounded-full");
+  else if (node.cornerRadius)
+    cls.push(node.cornerRadiusVar ? `rounded-${node.cornerRadiusVar}` : `rounded-[${r(node.cornerRadius)}px]`);
+  else if (node.rectangleCornerRadii) {
+    const [tl, tr, br, bl] = node.rectangleCornerRadii;
+    if (tl === tr && tr === br && br === bl) {
+      if (tl) cls.push(`rounded-[${r(tl)}px]`);
+    } else {
+      if (tl) cls.push(`rounded-tl-[${r(tl)}px]`);
+      if (tr) cls.push(`rounded-tr-[${r(tr)}px]`);
+      if (br) cls.push(`rounded-br-[${r(br)}px]`);
+      if (bl) cls.push(`rounded-bl-[${r(bl)}px]`);
+    }
+  }
 
-  // ---- Asset export (icons → SVG, image fills → PNG) ----
+  // Compositing (opacity / shadow / blur / blend / stacking) must also precede
+  // the export short-circuit — an <img> is composited like any other element.
+  cls.push(...compositingClasses(node));
+
+  // ---- Asset export (icons → SVG, image/video fills → PNG) ----
   // Detect before background/children so icons don't become empty boxes.
-  const icon = !isText && isIconNode(node);
+  // Curved text is an "icon" too: only an SVG can bend the glyphs.
+  // A partial ellipse is drawn, not exported — see arcShapes.
+  if (isArcEllipse(node) && geo) {
+    const shapes = arcShapes(node, geo.width, geo.height);
+    if (shapes) {
+      el.svg = { viewBox: `0 0 ${r(geo.width)} ${r(geo.height)}`, shapes };
+      return el;
+    }
+  }
+
+  const icon = isText ? curvedText : isIconNode(node);
   const imageLeaf = !isText && !icon && hasImageFill(node) && !node.children?.length;
+  // `exported` (computed with the geometry above) must agree, or the <img> gets
+  // sized for the wrong rectangle.
+  if ((icon || imageLeaf) !== exported && !isArcEllipse(node))
+    warn(opts, node, "внутреннее несоответствие: экспорт и геометрия разошлись");
+  // A video fill can't survive as a video — it lands as its first frame.
+  if (!isText && hasVideoFill(node))
+    warn(opts, node, "видео экспортировано первым кадром (статичная картинка)");
   if (icon || imageLeaf) {
     el.tag = "img";
-    const kind: "svg" | "png" = icon ? "svg" : "png";
+    // An "icon" built on a raster — a photo clipped by a vector mask, say —
+    // has no vectors to preserve: an SVG export would just wrap the bitmap in
+    // base64 and bloat the output, so render it straight to PNG.
+    const kind: "svg" | "png" = icon && !subtreeHasImageFill(node) ? "svg" : "png";
     el.asset = { id: node.id, kind };
     if (kind === "svg") cls.push("object-contain");
     // Respect the fill's scaleMode: FIT keeps the whole image (contain),
     // FILL/CROP fill the box (cover). Default to cover when unknown.
     else cls.push(imageScaleMode(node) === "FIT" ? "object-contain" : "object-cover");
-    assets.push({ id: node.id, kind, className: cls.join(" ") });
+    assets.push({ id: node.id, kind, className: cls.join(" "), name: node.name });
     return el;
   }
 
@@ -731,19 +1538,24 @@ function nodeToIR(
     const grads = fills.filter(
       (f) => f.visible !== false && f.type.startsWith("GRADIENT"),
     );
-    const img = fills.find((f) => f.visible !== false && f.type === "IMAGE");
+    const img = fills.find(isImagePaint);
     const solidPaint = firstSolidPaint(fills);
     if (grads.length) {
-      // Angular/diamond gradients have no CSS equivalent — approximated as a
-      // linear gradient, so flag it as lossy.
+      // A diamond gradient has no CSS equivalent — the closest match is a
+      // radial one, so flag it as lossy. (Angular maps exactly to conic.)
       for (const grad of grads)
-        if (grad.type === "GRADIENT_ANGULAR" || grad.type === "GRADIENT_DIAMOND")
-          warn(opts, node, `${grad.type} approximated as a linear gradient`);
+        if (grad.type === "GRADIENT_DIAMOND")
+          warn(opts, node, "GRADIENT_DIAMOND приближён радиальным градиентом");
       // Stack every gradient into one `background`. CSS paints the first layer
       // on top; Figma's fills[0] is the bottom layer — so reverse. A solid fill
       // beneath the gradients becomes the last (bottom) layer, expressed as a
       // flat gradient so it can share the shorthand.
-      const layers = [...grads].reverse().map(gradientCss).filter(Boolean) as string[];
+      const gw = geo?.width ?? 0;
+      const gh = geo?.height ?? 0;
+      const layers = [...grads]
+        .reverse()
+        .map((g) => gradientCss(g, gw, gh))
+        .filter(Boolean) as string[];
       if (solidPaint)
         layers.push(`linear-gradient(${solidPaint.value},${solidPaint.value})`);
       if (layers.length) el.style["background"] = layers.join(", ");
@@ -757,38 +1569,58 @@ function nodeToIR(
       else cls.push("bg-cover", "bg-center");
       el.style["background-image"] = `url(@@ASSET:${node.id}@@)`;
       el.style["background-color"] = "#e5e7eb"; // shown until the asset loads
-      assets.push({ id: node.id, kind: "png", className: "" });
+      assets.push({ id: node.id, kind: "png", className: "", name: node.name });
     } else if (solidPaint) {
       cls.push(colorClass("bg", solidPaint.value, opts.tokens, solidPaint.variableName));
-    }
-  }
-
-  // ---- Border radius ----
-  if (node.cornerRadius)
-    cls.push(node.cornerRadiusVar ? `rounded-${node.cornerRadiusVar}` : `rounded-[${r(node.cornerRadius)}px]`);
-  else if (node.rectangleCornerRadii) {
-    const [tl, tr, br, bl] = node.rectangleCornerRadii;
-    if (tl === tr && tr === br && br === bl) {
-      if (tl) cls.push(`rounded-[${r(tl)}px]`);
-    } else {
-      if (tl) cls.push(`rounded-tl-[${r(tl)}px]`);
-      if (tr) cls.push(`rounded-tr-[${r(tr)}px]`);
-      if (br) cls.push(`rounded-br-[${r(br)}px]`);
-      if (bl) cls.push(`rounded-bl-[${r(bl)}px]`);
     }
   }
 
   // ---- Strokes / border ----
   const strokePaint = firstSolidPaint(node.strokes);
   const stroke = strokePaint?.value ?? null;
-  if (stroke) {
+  const strokeGrad = !stroke
+    ? (node.strokes ?? []).find(
+        (f) => f.visible !== false && f.type.startsWith("GRADIENT"),
+      )
+    : undefined;
+  if (strokeGrad) {
+    // A gradient stroke isn't a border-color; border-image paints it. It does
+    // not follow rounded corners, so say so rather than shipping a silent
+    // mismatch.
+    const gcss = gradientCss(strokeGrad, geo?.width ?? 0, geo?.height ?? 0);
+    const wgt =
+      node.strokeWeight ??
+      Math.max(
+        node.individualStrokeWeights?.top ?? 0,
+        node.individualStrokeWeights?.right ?? 0,
+        node.individualStrokeWeights?.bottom ?? 0,
+        node.individualStrokeWeights?.left ?? 0,
+      );
+    if (gcss && wgt) {
+      el.style["border"] = `${r(wgt)}px solid transparent`;
+      el.style["border-image"] = `${gcss} 1`;
+      if (node.cornerRadius || node.rectangleCornerRadii?.some(Boolean))
+        warn(opts, node, "градиентная обводка не повторяет скругление углов");
+    }
+  } else if (stroke) {
     const isw = node.individualStrokeWeights;
-    // An OUTSIDE stroke sits beyond the box and must not consume layout space
-    // like a CSS border (border-box) would — an outline matches Figma exactly.
-    if (node.strokeAlign === "OUTSIDE" && node.strokeWeight) {
+    // A Figma stroke never consumes layout space, whatever its alignment; a CSS
+    // border does (border-box shrinks the content area). On a container that
+    // difference is not cosmetic: children sized to the full width — a row of
+    // cards adding up to exactly 1340px — no longer fit and wrap onto the next
+    // line. An outline is drawn without touching the box, and a negative offset
+    // puts it where Figma draws it.
+    const uniform = !!node.strokeWeight;
+    const outlined =
+      uniform && (node.strokeAlign === "OUTSIDE" || !!node.children?.length);
+    if (outlined) {
       const kind = node.strokeDashes?.length ? "dashed" : "solid";
-      el.style["outline"] = `${r(node.strokeWeight)}px ${kind} ${stroke}`;
-      el.style["outline-offset"] = "0px";
+      const w = node.strokeWeight!;
+      el.style["outline"] = `${r(w)}px ${kind} ${stroke}`;
+      // OUTSIDE sits beyond the edge, INSIDE within it, CENTER straddles it.
+      const offset =
+        node.strokeAlign === "OUTSIDE" ? 0 : node.strokeAlign === "CENTER" ? -w / 2 : -w;
+      el.style["outline-offset"] = `${r(offset)}px`;
     } else {
       let hasBorder = false;
       if (node.strokeWeight) {
@@ -809,48 +1641,13 @@ function nodeToIR(
     }
   }
 
-  // ---- Opacity ----
-  if (node.opacity != null && node.opacity < 1) {
-    cls.push(`opacity-[${+node.opacity.toFixed(2)}]`);
-  }
-
   // ---- Clip ----
   if (node.clipsContent) cls.push("overflow-hidden");
-
-  // ---- Shadows (all drop/inner shadows, comma-joined like CSS) ----
-  const shadows = (node.effects ?? []).filter(
-    (e) =>
-      e.visible !== false &&
-      (e.type === "DROP_SHADOW" || e.type === "INNER_SHADOW") &&
-      e.offset &&
-      e.color,
-  );
-  if (shadows.length) {
-    const parts = shadows.map((s) => {
-      const inset = s.type === "INNER_SHADOW" ? "inset_" : "";
-      return `${inset}${r(s.offset!.x)}px_${r(s.offset!.y)}px_${r(s.radius ?? 0)}px_${r(s.spread ?? 0)}px_${colorToHex(s.color!).replace(/\s/g, "")}`;
-    });
-    cls.push(`shadow-[${parts.join(",")}]`);
-  }
-
-  // ---- Layer / background blur ----
-  const layerBlur = (node.effects ?? []).find(
-    (e) => e.visible !== false && e.type === "LAYER_BLUR" && (e.radius ?? 0) > 0,
-  );
-  const bgBlur = (node.effects ?? []).find(
-    (e) => e.visible !== false && e.type === "BACKGROUND_BLUR" && (e.radius ?? 0) > 0,
-  );
-  if (layerBlur) cls.push(`blur-[${r(layerBlur.radius ?? 0)}px]`);
-  if (bgBlur) cls.push(`backdrop-blur-[${r(bgBlur.radius ?? 0)}px]`);
 
   // ---- Rotation ----
   if (node.rotation && Math.abs(node.rotation) > 0.5) {
     cls.push(`rotate-[${+node.rotation.toFixed(1)}deg]`);
   }
-
-  // ---- Blend mode (multiply / screen / overlay …) ----
-  const blend = blendClass(node.blendMode);
-  if (blend) cls.push(blend);
 
   // ---- Text ----
   if (isText) {
@@ -921,11 +1718,22 @@ function nodeToIR(
       if (node.maxLines && node.maxLines > 1) cls.push(`line-clamp-${node.maxLines}`);
       else cls.push("truncate");
     }
+    // Soft-wrap detection: Figma wraps text at the box width without putting
+    // "\n" into characters. When the box is taller than the explicit line count
+    // explains (rendered lines > "\n"-lines), the text IS wrapping — it must
+    // get its box width in CSS or the browser re-wraps it at the wrong points
+    // (and whitespace-nowrap would overflow onto the neighbours).
+    const explicitLines = (node.characters ?? "").split("\n").length;
+    const lineH = s.lineHeightPx || (s.fontSize ? s.fontSize * 1.2 : 0);
+    const softWraps =
+      !!geo && lineH > 0 && Math.round(geo.height / lineH) > explicitLines;
     // Fixed-width text (Figma autoResize HEIGHT/NONE) wraps at its box width;
     // without a width the copy renders on one line and overflows the layout.
     // Content-hugging text (WIDTH_AND_HEIGHT) is left width-less.
     const fixedWidthText =
-      node.textAutoResize === "NONE" || node.textAutoResize === "HEIGHT";
+      node.textAutoResize === "NONE" ||
+      node.textAutoResize === "HEIGHT" ||
+      softWraps;
     if (fixedWidthText && geo && !fillW && !constraintNoW)
       cls.push(`w-[${r(geo.width)}px]`);
     // Content-hugging text (autoResize WIDTH_AND_HEIGHT) sizes to its content and
@@ -934,18 +1742,52 @@ function nodeToIR(
     // or otherwise pinned mid-parent. whitespace-nowrap reproduces the hug.
     else if (node.textAutoResize === "WIDTH_AND_HEIGHT")
       cls.push("whitespace-nowrap");
+    // Figma laid this line out without wrapping (its box is exactly one line
+    // tall), so the browser must not wrap it either: a box stretched to a
+    // parent a few px narrower than the glyphs would otherwise break a value
+    // like "7 200" across two lines and overlap whatever sits below.
+    if (
+      !softWraps &&
+      geo &&
+      lineH > 0 &&
+      explicitLines === 1 &&
+      Math.round(geo.height / lineH) <= 1 &&
+      !cls.includes("whitespace-nowrap")
+    )
+      cls.push("whitespace-nowrap");
     // Bound to a component TEXT property → render `{propName}` in the JSX.
     if (node.textProp) {
       const pn = propIdent(node.textProp);
       if (opts.propNames?.has(pn)) el.textProp = pn;
     }
     const colorPaint = firstSolidPaint(node.fills);
-    if (colorPaint)
+    // A gradient-filled text node has no solid colour at all — painting the
+    // gradient behind the glyphs and clipping it to them is the only way to
+    // keep it (otherwise the text falls back to black).
+    const textGrad = (node.fills ?? []).find(
+      (f) => f.visible !== false && f.type.startsWith("GRADIENT"),
+    );
+    const textGradCss = textGrad
+      ? gradientCss(textGrad, geo?.width ?? 0, geo?.height ?? 0)
+      : null;
+    if (textGradCss) {
+      el.style["background-image"] = textGradCss;
+      cls.push("bg-clip-text", "text-transparent");
+    } else if (colorPaint)
       cls.push(colorClass("text", colorPaint.value, opts.tokens, colorPaint.variableName));
   }
 
   // ---- Children ----
   if (!isText && node.children) {
+    // A masked group that also holds text can't be flattened (that would burn
+    // the copy into a picture), and CSS can't clip to a vector — say so, since
+    // the masked layers render unclipped.
+    if (hasMaskedChild(node))
+      warn(
+        opts,
+        node,
+        "векторная маска не воспроизводится в CSS — слои отрисованы без обрезки",
+      );
     for (const child of node.children) {
       const c = nodeToIR(child, node, opts, assets);
       if (c) el.children.push(c);
@@ -1020,7 +1862,46 @@ function nodeToIR(
     }
   }
 
+  // ---- Layer provenance: carry the designer's own naming into the markup so
+  // the generated tree stays greppable against the Figma file.
+  if (opts.layerNames) {
+    const label = (node.name ?? "").trim();
+    if (label) el.attrs = { ...el.attrs, "data-name": label };
+    const styleName =
+      node.style?.textStyleName ?? node.fillStyleName ?? node.effectStyleName;
+    if (styleName) el.attrs = { ...el.attrs, "data-style": styleName };
+  }
+
   return el;
+}
+
+/**
+ * Do this auto-layout frame's children need more room along its primary axis
+ * than the frame has? Figma allows that (and clips); flexbox does not, and the
+ * overflow lands on whichever side the justification pushes it. See the call
+ * site.
+ */
+function overflowsPrimaryAxis(node: FigmaNode): boolean {
+  const box = node.absoluteBoundingBox;
+  if (!box) return false;
+  const horiz = node.layoutMode === "HORIZONTAL";
+  const kids = (node.children ?? []).filter(
+    (c) => c.visible !== false && c.layoutPositioning !== "ABSOLUTE",
+  );
+  if (!kids.length) return false;
+  let need =
+    (node.itemSpacing ?? 0) * (kids.length - 1) +
+    (horiz
+      ? (node.paddingLeft ?? 0) + (node.paddingRight ?? 0)
+      : (node.paddingTop ?? 0) + (node.paddingBottom ?? 0));
+  for (const c of kids) {
+    const b = c.absoluteBoundingBox;
+    // A child that stretches or hugs cannot be measured from its box alone.
+    if (!b || (horiz ? c.layoutSizingHorizontal : c.layoutSizingVertical) === "FILL")
+      return false;
+    need += horiz ? b.width : b.height;
+  }
+  return need > (horiz ? box.width : box.height) + 0.5;
 }
 
 function axisToJustify(a?: string): string | null {
@@ -1102,6 +1983,16 @@ function attrsStr(attrs?: Record<string, string>): string {
     .join("");
 }
 
+/** Provenance attributes are labels, not structure - two list items named
+ * "Card 1" / "Card 2" are still the same shape. */
+function structAttrs(attrs?: Record<string, string>): Record<string, string> {
+  if (!attrs) return {};
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(attrs))
+    if (k !== "data-name" && k !== "data-style") out[k] = v;
+  return out;
+}
+
 /** A structural fingerprint of an element that ignores text *content* (but not
  * its presence) — two elements with the same key differ only in what they say. */
 function structKey(el: IRElement): string {
@@ -1112,8 +2003,9 @@ function structKey(el: IRElement): string {
     "|" +
     JSON.stringify(el.style) +
     "|" +
-    JSON.stringify(el.attrs ?? {}) +
+    JSON.stringify(structAttrs(el.attrs)) +
     (el.asset ? "#A" : "") +
+    (el.svg ? "#S" + JSON.stringify(el.svg) : "") +
     (el.text != null ? "#T" : "") +
     "(" +
     el.children.map(structKey).join("") +
@@ -1219,6 +2111,10 @@ function serializeCore(el: IRElement, indent: number): string {
     return `${pad}<${el.tag}${className}${style}${attrs}>${text}</${el.tag}>`;
   }
 
+  if (el.svg) {
+    return `${pad}<svg${className}${style} viewBox="${el.svg.viewBox}" fill="none" xmlns="http://www.w3.org/2000/svg">${svgPaths(el.svg.shapes, true)}</svg>`;
+  }
+
   if (el.asset) {
     return `${pad}<img${className}${style} src="@@ASSET:${el.asset.id}@@" alt="${el.name.replace(/"/g, "")}" />`;
   }
@@ -1244,6 +2140,29 @@ function serializeCore(el: IRElement, indent: number): string {
   return `${pad}<${el.tag}${className}${style}${attrs}>\n${inner}\n${pad}</${el.tag}>`;
 }
 
+/** Render generated shapes as SVG children (JSX camel-cases stroke-width). */
+function svgPaths(shapes: SvgShape[], jsx: boolean): string {
+  return shapes
+    .map((sh) => {
+      const cap = sh.linecap
+        ? jsx
+          ? ` strokeLinecap="${sh.linecap}"`
+          : ` stroke-linecap="${sh.linecap}"`
+        : "";
+      const stroke = sh.stroke
+        ? ` stroke="${sh.stroke}"${
+            sh.strokeWidth != null
+              ? jsx
+                ? ` strokeWidth="${sh.strokeWidth}"`
+                : ` stroke-width="${sh.strokeWidth}"`
+              : ""
+          }${cap}`
+        : "";
+      return `<path d="${sh.d}" fill="${sh.fill}"${stroke} />`;
+    })
+    .join("");
+}
+
 /** True when every child is a plain-text leaf run (a styled <span>/<a> segment). */
 function isInlineTextRuns(el: IRElement): boolean {
   return (
@@ -1254,18 +2173,25 @@ function isInlineTextRuns(el: IRElement): boolean {
   );
 }
 
+/**
+ * A styled run keeps its line breaks like any other text: a raw newline inside
+ * a <span> collapses to a space, silently joining two lines of a caption into
+ * one. The plain-text paths already do this — the inline ones must match.
+ */
+const breakLines = (t: string) => t.replace(/\n/g, "<br />");
+
 function serializeInline(el: IRElement): string {
   const className = el.classes.length ? ` className="${el.classes.join(" ")}"` : "";
   const style = styleToJsx(el.style);
   const attrs = attrsStr(el.attrs);
-  return `<${el.tag}${className}${style}${attrs}>${escapeJsxText(el.text ?? "")}</${el.tag}>`;
+  return `<${el.tag}${className}${style}${attrs}>${breakLines(escapeJsxText(el.text ?? ""))}</${el.tag}>`;
 }
 
 function serializeInlineHtml(el: IRElement): string {
   const className = el.classes.length ? ` class="${el.classes.join(" ")}"` : "";
   const style = styleToHtml(el.style);
   const attrs = attrsStr(el.attrs);
-  return `<${el.tag}${className}${style}${attrs}>${escapeHtml(el.text ?? "")}</${el.tag}>`;
+  return `<${el.tag}${className}${style}${attrs}>${breakLines(escapeHtml(el.text ?? ""))}</${el.tag}>`;
 }
 
 function styleToHtml(style: Record<string, string>): string {
@@ -1292,6 +2218,9 @@ function serializeHtml(el: IRElement, indent: number): string {
   if (el.text != null && !el.children.length) {
     const text = escapeHtml(el.text).replace(/\n/g, "<br />");
     return `${pad}<${tag}${className}${style}${attrs}>${text}</${tag}>`;
+  }
+  if (el.svg) {
+    return `${pad}<svg${className}${style} viewBox="${el.svg.viewBox}" fill="none" xmlns="http://www.w3.org/2000/svg">${svgPaths(el.svg.shapes, false)}</svg>`;
   }
   if (el.asset) {
     return `${pad}<img${className}${style} src="@@ASSET:${el.asset.id}@@" alt="${escapeHtml(el.name)}" />`;
@@ -1363,6 +2292,8 @@ function twDecls(
     else if (c === "bg-cover") d["background-size"] = "cover";
     else if (c === "bg-center") d["background-position"] = "center";
     else if (c === "overflow-hidden") d.overflow = "hidden";
+    else if (c === "isolate") d.isolation = "isolate";
+    else if (c === "-z-10") d["z-index"] = "-10";
     else if (c === "bg-contain") d["background-size"] = "contain";
     else if (c === "bg-no-repeat") d["background-repeat"] = "no-repeat";
     else if (c === "bg-repeat") d["background-repeat"] = "repeat";
@@ -1398,6 +2329,8 @@ function twDecls(
     // arbitrary-value utilities: prop-[value]
     else if (arb && c.startsWith("left-[")) d.left = arb;
     else if (arb && c.startsWith("top-[")) d.top = arb;
+    else if (arb && c.startsWith("gap-x-[")) d["column-gap"] = arb;
+    else if (arb && c.startsWith("gap-y-[")) d["row-gap"] = arb;
     else if (arb && c.startsWith("gap-[")) d.gap = arb;
     else if (arb && c.startsWith("w-[")) d.width = arb;
     else if (arb && c.startsWith("h-[")) d.height = arb;
@@ -1531,6 +2464,9 @@ function serializeCssMod(el: IRElement, indent: number, ctx: CssModCtx): string 
   }
   const attrs = attrsStr(el.attrs);
 
+  if (el.svg) {
+    return `${pad}<svg${classAttr} viewBox="${el.svg.viewBox}" fill="none" xmlns="http://www.w3.org/2000/svg">${svgPaths(el.svg.shapes, true)}</svg>`;
+  }
   if (el.asset) {
     return `${pad}<img${classAttr} src="@@ASSET:${el.asset.id}@@" alt="${el.name.replace(/"/g, "")}" />`;
   }

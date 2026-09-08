@@ -9,7 +9,12 @@ type Tab = "figma" | "render";
 const CHECKER =
   "repeating-conic-gradient(#d7d7dd 0% 25%, #f2f2f5 0% 50%) 50% / 24px 24px";
 
-function buildSrcDoc(html: string, theme: PreviewTheme | null | undefined, bg: string): string {
+function buildSrcDoc(
+  html: string,
+  theme: PreviewTheme | null | undefined,
+  bg: string,
+  fontFaceCss?: string,
+): string {
   // Feed token names to the Tailwind Play CDN so bg-purple-500 / font-inter
   // render with the design's actual values inside the preview.
   const hasTheme =
@@ -29,9 +34,11 @@ function buildSrcDoc(html: string, theme: PreviewTheme | null | undefined, bg: s
       )},fontSize:${JSON.stringify(theme!.fontSize ?? {})}}}}</script>`
     : "";
   const background = bg === "checker" ? CHECKER : bg;
+  const fontStyle = fontFaceCss ? `<style>${fontFaceCss}</style>` : "";
   return `<!doctype html><html><head>
 <meta charset="utf-8" />
 <script src="https://cdn.tailwindcss.com"></script>${config}
+${fontStyle}
 <style>body{margin:0;display:flex;align-items:flex-start;justify-content:center;padding:24px;background:${background};}</style>
 </head><body>${html}</body></html>`;
 }
@@ -47,11 +54,13 @@ export default function PreviewPanel({
   html,
   loading,
   theme,
+  fontFaceCss,
 }: {
   imageUrl: string | null;
   html: string;
   loading: boolean;
   theme?: PreviewTheme | null;
+  fontFaceCss?: string;
 }) {
   const [tab, setTab] = useState<Tab>("figma");
   const [bg, setBg] = useState("#ffffff");
@@ -67,8 +76,8 @@ export default function PreviewPanel({
   };
 
   const srcDoc = useMemo(
-    () => (html ? buildSrcDoc(html, theme, bg) : ""),
-    [html, theme, bg],
+    () => (html ? buildSrcDoc(html, theme, bg, fontFaceCss) : ""),
+    [html, theme, bg, fontFaceCss],
   );
 
   const isCustom = bg !== "checker" && !PRESETS.some((p) => p.value === bg);

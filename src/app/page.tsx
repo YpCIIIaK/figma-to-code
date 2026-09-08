@@ -5,7 +5,10 @@ import LayerTree from "@/components/LayerTree";
 import CodePanel from "@/components/CodePanel";
 import PreviewPanel from "@/components/PreviewPanel";
 import TokensPanel from "@/components/TokensPanel";
+import FontsPanel from "@/components/FontsPanel";
 import { convertNode, convertNodes, combineNodes } from "@/lib/figma/convert";
+import { extractTokens } from "@/lib/figma/tokens";
+import { fetchFonts, putFonts, fetchFontCss, type FontFace } from "@/lib/fonts";
 import { findNode, toTree } from "@/lib/figma/tree";
 import type { FigmaNode, TreeNode, VarToken } from "@/lib/figma/types";
 import { makeZip, downloadBlob, dataUriToBytes, type ZipEntry } from "@/lib/zip";
@@ -43,6 +46,11 @@ export default function Home() {
   const [inferLayout, setInferLayout] = useState(false);
   // Fluid root (w-full + max-w) so the block adapts to narrow viewports (opt-in).
   const [responsive, setResponsive] = useState(false);
+  // Keep the Figma layer / style names in the markup as data-name / data-style.
+  const [layerNames, setLayerNames] = useState(false);
+  // User-uploaded font files → @font-face in the preview + exported code.
+  const [fonts, setFonts] = useState<FontFace[]>([]);
+  const [showFonts, setShowFonts] = useState(false);
   // Design-system variables from the plugin payload (color/primary/500, etc.).
   const [variables, setVariables] = useState<VarToken[]>([]);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -73,14 +81,17 @@ export default function Home() {
     if (u) setUrl(u);
     editsRef.current = loadEdits();
     setHistory(loadHistory());
+    // Fonts live on the server now (localStorage's quota fit ~2 families);
+    // this also migrates a set left over from the localStorage days.
+    fetchFonts().then(setFonts).catch(() => {});
   }, []);
 
   // A stable key for the current output config — edits are saved per exact
   // selection + toggle combination, so restoring them never shows stale code.
   const selectionKey = useMemo(() => {
     const ids = [...selectedIds].sort().join(",");
-    return `${fileKey ?? ""}|${ids}|${multiMode}|${useTokens ? 1 : 0}|${semantic ? 1 : 0}|${inferLayout ? 1 : 0}|${responsive ? 1 : 0}`;
-  }, [fileKey, selectedIds, multiMode, useTokens, semantic, inferLayout, responsive]);
+    return `${fileKey ?? ""}|${ids}|${multiMode}|${useTokens ? 1 : 0}|${semantic ? 1 : 0}|${inferLayout ? 1 : 0}|${responsive ? 1 : 0}|${layerNames ? 1 : 0}`;
+  }, [fileKey, selectedIds, multiMode, useTokens, semantic, inferLayout, responsive, layerNames]);
 
   // Resolve checked ids to actual nodes (tree is already loaded client-side).
   const selectedNodes = useMemo(() => {
@@ -92,10 +103,10 @@ export default function Home() {
 
   const converted = useMemo(() => {
     if (!selectedNodes.length) return null;
-    const opts = { absolutePositioning: true, useTokens, semantic, inferLayout, responsive, variables };
+    const opts = { absolutePositioning: true, useTokens, semantic, inferLayout, responsive, layerNames, variables };
     if (selectedNodes.length === 1) return convertNode(selectedNodes[0], opts);
     return convertNodes(selectedNodes, multiMode, opts);
-  }, [selectedNodes, multiMode, useTokens, semantic, inferLayout, responsive, variables]);
+  }, [selectedNodes, multiMode, useTokens, semantic, inferLayout, responsive, layerNames, variables]);
 
   // Node fed to the token extractor (synthetic group when multiple selected).
   const tokenNode = useMemo(() => {
@@ -103,6 +114,35 @@ export default function Home() {
     if (selectedNodes.length === 1) return selectedNodes[0];
     return combineNodes(selectedNodes);
   }, [selectedNodes]);
+
+  // Font families the current selection actually uses (name + usage count) —
+  // drives the Fonts panel's "needed families" list and which @font-face rules
+  // get emitted.
+  const designFamilies = useMemo(() => {
+    if (!tokenNode) return [] as { family: string; count: number }[];
+    return extractTokens(tokenNode).fontFamilies.map((f) => ({
+      family: f.value,
+      count: f.count,
+    }));
+  }, [tokenNode]);
+
+  // @font-face block for the uploaded fonts, limited to the families in use.
+  // The bytes live server-side, so this is fetched rather than computed.
+  const [fontFaceCss, setFontFaceCss] = useState("");
+  useEffect(() => {
+    const families = designFamilies.map((d) => d.family);
+    if (!fonts.length || !families.length) {
+      setFontFaceCss("");
+      return;
+    }
+    let alive = true;
+    fetchFontCss(families)
+      .then((css) => alive && setFontFaceCss(css))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [fonts, designFamilies]);
 
   // Resolved (asset-injected) outputs shown in the UI.
   const [reactCode, setReactCode] = useState("");
@@ -181,12 +221,16 @@ export default function Home() {
   useEffect(() => {
     // In token mode, prepend the @theme block as a copy-paste header (valid
     // JS/HTML comment); the live preview gets the palette via Tailwind config.
+    // The paste-into-globals.css header bundles the uploaded @font-face rules
+    // (real CSS) together with the token @theme block.
     const themeCss = converted?.themeCss;
-    const reactHeader = themeCss
-      ? `/* Tailwind v4 — вставьте в globals.css:\n${themeCss}*/\n\n`
+    const globalsCss =
+      (fontFaceCss ? fontFaceCss + "\n\n" : "") + (themeCss ?? "");
+    const reactHeader = globalsCss
+      ? `/* Вставьте в globals.css:\n${globalsCss}*/\n\n`
       : "";
-    const htmlHeader = themeCss
-      ? `<!-- Tailwind v4 — вставьте в globals.css:\n${themeCss}-->\n`
+    const htmlHeader = globalsCss
+      ? `<!-- Вставьте в globals.css:\n${globalsCss}-->\n`
       : "";
 
     if (!converted || !fileKey) {
@@ -198,7 +242,7 @@ export default function Home() {
       setHtmlIsEdited(!!edit);
       setVueCode(converted?.vue ?? "");
       setCssJsx(converted?.cssModule.jsx ?? "");
-      setCssText(converted?.cssModule.css ?? "");
+      setCssText((fontFaceCss ? fontFaceCss + "\n\n" : "") + (converted?.cssModule.css ?? ""));
       setPreviewHtml(edit ?? converted?.html ?? "");
       return;
     }
@@ -217,7 +261,11 @@ export default function Home() {
       for (const a of assets) {
         if (a.kind === "svg") {
           const markup = svg[a.id];
-          if (mode === "datauri") {
+          // An SVG too heavy to inline arrives already rasterized, as a plain
+          // image URL / data URI - drop it in as-is instead of re-encoding it.
+          if (markup && !markup.trimStart().startsWith("<")) {
+            res = res.replace(`@@ASSET:${a.id}@@`, markup);
+          } else if (mode === "datauri") {
             const dataUri = markup
               ? `data:image/svg+xml,${encodeURIComponent(markup)}`
               : "";
@@ -250,7 +298,7 @@ export default function Home() {
       setHtmlIsEdited(!!edit);
       setVueCode(inject(vue, "inline", svg, png));
       setCssJsx(inject(cssModule.jsx, "datauri", svg, png));
-      setCssText(cssModule.css);
+      setCssText((fontFaceCss ? fontFaceCss + "\n\n" : "") + cssModule.css);
       setPreviewHtml(edit ?? resHtml);
     };
 
@@ -314,7 +362,7 @@ export default function Home() {
     return () => {
       cancelled = true;
     };
-  }, [converted, fileKey, token, selectionKey]);
+  }, [converted, fileKey, token, selectionKey, fontFaceCss]);
 
   // Bundle every generated format + assets + tokens into a downloadable .zip.
   const downloadZip = useCallback(() => {
@@ -328,13 +376,14 @@ export default function Home() {
       { name: `${name}.module.css`, data: cssText },
     ];
     if (converted.themeCss) files.push({ name: "tokens.css", data: converted.themeCss });
+    if (fontFaceCss) files.push({ name: "fonts.css", data: fontFaceCss });
 
     const pngNotes: string[] = [];
     for (const a of converted.assets) {
       const hit = assetCache.current.get(`${a.kind}:${a.id}`);
       if (!hit) continue;
       const safe = a.id.replace(/:/g, "-");
-      if (a.kind === "svg") {
+      if (a.kind === "svg" && hit.trimStart().startsWith("<")) {
         files.push({ name: `assets/${safe}.svg`, data: hit });
       } else {
         const bytes = dataUriToBytes(hit);
@@ -359,7 +408,7 @@ export default function Home() {
     files.push({ name: "README.txt", data: readme });
 
     downloadBlob(makeZip(files), `${name}.zip`);
-  }, [converted, reactCode, htmlCode, vueCode, cssJsx, cssText, fileName]);
+  }, [converted, reactCode, htmlCode, vueCode, cssJsx, cssText, fileName, fontFaceCss]);
 
   // Persist a manual HTML edit for the current selection and live-update preview.
   const handleHtmlEdit = useCallback(
@@ -688,6 +737,7 @@ export default function Home() {
             html={previewHtml}
             loading={previewLoading}
             theme={converted?.previewTheme ?? null}
+            fontFaceCss={fontFaceCss}
           />
         </section>
 
@@ -739,7 +789,7 @@ export default function Home() {
                 </button>
                 <button
                   onClick={() => setInferLayout((v) => !v)}
-                  title="Превращать распознанный авто-лейаут в flex вместо absolute (может изменить структуру)"
+                  title="Распознавать ряды, колонки и сетки повторяющихся элементов и превращать их в flex/flex-wrap вместо absolute-координат (может изменить структуру)"
                   className={`rounded border px-2 py-0.5 text-xs font-medium ${
                     inferLayout
                       ? "border-accent bg-accent/20 text-white"
@@ -758,6 +808,28 @@ export default function Home() {
                   }`}
                 >
                   Адаптив
+                </button>
+                <button
+                  onClick={() => setLayerNames((v) => !v)}
+                  title={'Сохранять имена слоёв и стилей из Figma в коде: data-name="Card / Header", data-style="heading-h1"'}
+                  className={`rounded border px-2 py-0.5 text-xs font-medium ${
+                    layerNames
+                      ? "border-accent bg-accent/20 text-white"
+                      : "border-border text-foreground/50 hover:text-foreground"
+                  }`}
+                >
+                  Имена слоёв
+                </button>
+                <button
+                  onClick={() => setShowFonts(true)}
+                  title="Загрузить файлы шрифтов из Figma (zip/woff2/ttf) — они встроятся в превью и в экспорт как @font-face"
+                  className={`rounded border px-2 py-0.5 text-xs font-medium ${
+                    fonts.length
+                      ? "border-accent bg-accent/20 text-white"
+                      : "border-border text-foreground/50 hover:text-foreground"
+                  }`}
+                >
+                  Шрифты{fonts.length ? ` (${fonts.length})` : ""}
                 </button>
               </>
             )}
@@ -816,6 +888,19 @@ export default function Home() {
           </div>
         </section>
       </div>
+
+      {showFonts && (
+        <FontsPanel
+          designFamilies={designFamilies}
+          initial={fonts}
+          onClose={() => setShowFonts(false)}
+          onSave={async (faces) => {
+            const res = await putFonts(faces);
+            if (res.ok) setFonts(res.faces ?? faces);
+            return res;
+          }}
+        />
+      )}
     </div>
   );
 }

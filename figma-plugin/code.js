@@ -3,11 +3,28 @@
 // produces (see src/lib/figma/types.ts), and exports each icon/image locally
 // via exportAsync — so the app never touches Figma's rate-limited render API.
 
-figma.showUI(__html__, { width: 320, height: 320 });
+// The window is resizable (drag handle in the UI); start at the last size the
+// designer left it at, clamped so a stale value can never strand the plugin
+// off-screen or smaller than its own toolbar.
+const MIN_W = 320, MIN_H = 320, MAX_W = 1600, MAX_H = 1200;
+const clampW = (w) => Math.max(MIN_W, Math.min(MAX_W, Math.round(w) || MIN_W));
+const clampH = (h) => Math.max(MIN_H, Math.min(MAX_H, Math.round(h) || MIN_H));
+
+figma.showUI(__html__, { width: 560, height: 560 });
+
+figma.clientStorage.getAsync("uiSize").then((size) => {
+  if (size && size.width && size.height)
+    figma.ui.resize(clampW(size.width), clampH(size.height));
+});
 
 // Restore the saved app address and push a live selection count to the UI.
 figma.clientStorage.getAsync("endpoint").then((ep) => {
   if (ep) figma.ui.postMessage({ type: "endpoint", endpoint: ep });
+});
+
+// Restore the saved conversion options (tokens / semantic / layout / responsive).
+figma.clientStorage.getAsync("options").then((o) => {
+  if (o) figma.ui.postMessage({ type: "options", options: o });
 });
 
 function postSelectionCount() {
@@ -20,6 +37,18 @@ figma.on("selectionchange", postSelectionCount);
 postSelectionCount();
 
 const VECTOR_TYPES = ["VECTOR", "BOOLEAN_OPERATION", "STAR", "REGULAR_POLYGON", "LINE"];
+// The Plugin API and the REST API disagree on a few node type names, and this
+// payload is meant to be REST-shaped. Left untranslated a triangle (POLYGON)
+// misses VECTOR_TYPES and lands as a plain filled <div> — a square where the
+// map pin's arrow should be.
+const TYPE_ALIASES = {
+  POLYGON: "REGULAR_POLYGON",
+  // Figma Draw: a transform group is an ordinary group, and text bent along a
+  // path has no REST (or CSS) equivalent — it only survives as a flat vector.
+  TRANSFORM_GROUP: "GROUP",
+  TEXT_PATH: "VECTOR",
+};
+const restType = (t) => TYPE_ALIASES[t] || t;
 const CONTAINER_TYPES = ["FRAME", "GROUP", "INSTANCE", "COMPONENT"];
 
 const isNum = (v) => typeof v === "number";
@@ -39,14 +68,120 @@ function isArcEllipse(n) {
   const full = Math.abs(a.endingAngle - a.startingAngle) >= Math.PI * 2 - 0.001;
   return !full || (a.innerRadius && a.innerRadius > 0);
 }
+// Text bent around a circle — each letter/word is its own rotated TEXT node.
+// CSS has no text-on-path, so the whole ring must flatten into one SVG asset.
+function collectTextNodes(n, acc) {
+  if (n.type === "TEXT") acc.push(n);
+  for (const c of n.children || []) collectTextNodes(c, acc);
+}
+// A word laid out on a path: Figma splits it into one TEXT node per glyph.
+// Rotation is no help (along a gentle arc each letter tilts a degree or two),
+// but no hand-built layout splits a word into single-character layers. Left as
+// HTML it explodes into dozens of absolutely-positioned <p>s.
+function isSplitGlyphText(n) {
+  const kids = n.children || [];
+  if (kids.length < 5) return false;
+  if (!kids.every(function (c) { return c.type === "TEXT"; })) return false;
+  const glyphs = kids.filter(function (c) {
+    return typeof c.characters === "string" && c.characters.trim().length <= 2;
+  });
+  return glyphs.length >= kids.length * 0.8;
+}
+/** Does this container hold a mask layer (which clips its later siblings)? */
+function hasMaskedChild(n) {
+  return (n.children || []).some(function (c) { return c.isMask; });
+}
+// Text a reader is meant to select: upright, more than one glyph. Rotated ring
+// labels don't count — those only survive flattened into an SVG anyway.
+function subtreeHasRealText(n) {
+  if (
+    n.type === "TEXT" &&
+    (!isNum(n.rotation) || Math.abs(n.rotation) <= 10) &&
+    typeof n.characters === "string" &&
+    n.characters.trim().length > 1
+  )
+    return true;
+  return (n.children || []).some(subtreeHasRealText);
+}
+function isTextRing(n) {
+  // Tight on purpose: a whole section that merely contains a ringed chart
+  // label must not collapse into one flat image. Demand real ring geometry —
+  // a roughly square box, short labels, centres at a consistent radius.
+  // A ring is a flat bag of glyph/word layers; a container of frames is a
+  // section that merely holds one, and must not be flattened.
+  const kids = n.children || [];
+  if (!kids.length || !kids.every(function (c) { return c.type === "TEXT"; })) return false;
+  const texts = [];
+  collectTextNodes(n, texts);
+  if (texts.length < 3 || texts.length > 80) return false;
+  const rotated = texts.filter(function (t) {
+    return isNum(t.rotation) && Math.abs(t.rotation) > 10;
+  });
+  if (rotated.length < texts.length * 0.6) return false;
+  for (const t of rotated)
+    if (typeof t.characters === "string" && t.characters.length > 40) return false;
+  const box = n.absoluteBoundingBox;
+  if (!box || !box.width || !box.height) return false;
+  const aspect = box.width / box.height;
+  if (aspect < 0.5 || aspect > 2) return false;
+  const cx = box.x + box.width / 2;
+  const cy = box.y + box.height / 2;
+  const radii = [];
+  for (const t of rotated) {
+    const b = t.absoluteBoundingBox;
+    if (!b) return false;
+    const dx = b.x + b.width / 2 - cx;
+    const dy = b.y + b.height / 2 - cy;
+    radii.push(Math.sqrt(dx * dx + dy * dy));
+  }
+  const max = Math.max.apply(null, radii);
+  const min = Math.min.apply(null, radii);
+  return max > 0 && min >= max * 0.5;
+}
+// Text bent along a path (Figma Draw "text on a path") has no CSS equivalent —
+// only an SVG export reproduces it. Detect via the API marker when Figma
+// exposes one, else by geometry: a straight text block is ~lines × lineHeight
+// tall, while path text produces a box far taller than any line count explains
+// (a ring is roughly square).
+function isCurvedText(node) {
+  if (node.type !== "TEXT") return false;
+  if (node.textPath || node.textPathData) return true;
+  const chars = typeof node.characters === "string" ? node.characters : "";
+  if (!chars) return false;
+  const w = node.width;
+  const h = node.height;
+  if (!isNum(w) || !isNum(h) || !w || !h) return false;
+  const fs = isNum(node.fontSize) ? node.fontSize : 14;
+  const lineH = fs * 1.5;
+  // Худшая (максимальная) оценка числа строк при переносе по ширине бокса.
+  const perLine = Math.max(1, Math.floor(w / (fs * 0.55)));
+  let lines = 0;
+  for (const part of chars.split("\n"))
+    lines += Math.max(1, Math.ceil(part.length / perLine));
+  return h > Math.max(lineH, lines * lineH) * 2.2;
+}
 function isIconNode(n) {
   if (VECTOR_TYPES.indexOf(n.type) !== -1) return true;
   if (isArcEllipse(n)) return true;
-  if (CONTAINER_TYPES.indexOf(n.type) !== -1 && n.children && n.children.length) {
+  var isContainer = CONTAINER_TYPES.indexOf(n.type) !== -1;
+  // Honour the serialized svgExport mark (designer's "Export as SVG" or curved
+  // text detected below) — collectAssets walks the serialized tree. But a
+  // container full of real text stays HTML: designers routinely leave export
+  // settings on a whole section, and obeying that flattens it into a picture.
+  if (n.svgExport && !hasImageFill(n) && !(isContainer && subtreeHasRealText(n)))
+    return true;
+  if (isContainer && n.children && n.children.length) {
     // A photo (image fill) is never an icon — flattening it to SVG embeds the
     // raster and bloats the code; let it become a background image instead.
     if (hasImageFill(n)) return false;
-    if (subtreeHasText(n)) return false;
+    // A vector mask (a country outline clipping a filled rectangle, say) has no
+    // CSS equivalent — layer by layer it degrades into a solid block the size
+    // of the group. One flattened SVG is the only faithful output.
+    if (hasMaskedChild(n) && !subtreeHasRealText(n)) return true;
+    // Ordinary text keeps the container HTML; a circular-text ring is the
+    // exception — it only survives as a flattened SVG.
+    if (isSplitGlyphText(n)) return true;
+    if (subtreeHasText(n)) return isTextRing(n);
     if (!subtreeHasVector(n)) return false;
     // Vectors nested in their own frames/groups are separate icons (e.g. a row
     // of social icons) — keep them split instead of merging into one big SVG.
@@ -58,11 +193,18 @@ function isIconNode(n) {
   }
   return false;
 }
+// A video fill counts as an image: exportAsync renders the clip's first frame,
+// so it becomes a still poster instead of an empty box.
+function isImagePaint(f) {
+  return f.visible !== false && (f.type === "IMAGE" || f.type === "VIDEO");
+}
+/** Does anything in this subtree paint a bitmap (photo / video fill)? */
+function subtreeHasImageFill(n) {
+  if (hasImageFill(n)) return true;
+  return (n.children || []).some(subtreeHasImageFill);
+}
 function hasImageFill(n) {
-  return (
-    Array.isArray(n.fills) &&
-    n.fills.some((f) => f.visible !== false && f.type === "IMAGE")
-  );
+  return Array.isArray(n.fills) && n.fills.some(isImagePaint);
 }
 
 // A prototype reaction (OPEN_URL / navigate) is a far more reliable signal of a
@@ -157,6 +299,17 @@ async function resolveVar(id, cache) {
   return out;
 }
 
+/** Shared-style props worth resolving to a design-system name. */
+var STYLE_PROPS = ["textStyleId", "fillStyleId", "strokeStyleId", "effectStyleId"];
+
+/** Collect every shared-style id used on a node (skipping figma.mixed). */
+function styleIds(n, acc) {
+  for (var i = 0; i < STYLE_PROPS.length; i++) {
+    const v = n[STYLE_PROPS[i]];
+    if (typeof v === "string" && v) acc.add(v);
+  }
+}
+
 function boundIds(bv, acc) {
   if (!bv) return;
   for (const k in bv) {
@@ -175,8 +328,10 @@ async function buildContext(topNodes) {
   const cache = new Map();
   const comp = new Map();
   const ids = new Set();
+  const sids = new Set();
   async function walk(n) {
     boundIds(n.boundVariables, ids);
+    styleIds(n, sids);
     if (n.type === "INSTANCE" && typeof n.getMainComponentAsync === "function") {
       try {
         const mc = await n.getMainComponentAsync();
@@ -193,7 +348,26 @@ async function buildContext(topNodes) {
   }
   for (const t of topNodes) await walk(t);
   for (const id of ids) await resolveVar(id, cache);
-  return { cache, comp, tokens: new Map() };
+
+  // Classic shared styles ("Heading/H1", "Brand/Primary") live outside the
+  // variables system, but carry the same designer intent — resolve their names.
+  const styles = new Map();
+  for (const id of sids) {
+    try {
+      const st = await figma.getStyleByIdAsync(id);
+      if (st && st.name) styles.set(id, sanitizeVarName(st.name));
+    } catch (e) {
+      /* a style from an unloaded library — fall back to raw values */
+    }
+  }
+  return { cache, comp, styles, tokens: new Map() };
+}
+
+/** Resolve one shared-style property to its sanitized design-system name. */
+function styleNameOf(node, prop, ctx) {
+  const id = node[prop];
+  if (typeof id !== "string" || !id) return undefined;
+  return ctx.styles.get(id);
 }
 
 /** Look up a bound variable's token name for a single-value property. */
@@ -237,8 +411,9 @@ function paintToRest(p) {
   const out = { type: p.type, visible: p.visible !== false, opacity: p.opacity };
   if (p.type === "SOLID" && p.color) {
     out.color = { r: p.color.r, g: p.color.g, b: p.color.b, a: 1 };
-  } else if (p.type === "IMAGE") {
+  } else if (p.type === "IMAGE" || p.type === "VIDEO") {
     // scaleMode (FILL/FIT/TILE/CROP) decides object-fit / background-size.
+    // A VIDEO paint carries the same sizing — it exports as its first frame.
     if (p.scaleMode) out.scaleMode = p.scaleMode;
   } else if (typeof p.type === "string" && p.type.indexOf("GRADIENT") === 0) {
     out.gradientStops = (p.gradientStops || []).map((s) => ({
@@ -341,10 +516,40 @@ function tagPaintVars(paints, aliases, ctx) {
   }
 }
 
+/** SVG markup bigger than this is never worth inlining as a data URI. */
+var SVG_MAX_BYTES = 96 * 1024;
+
+/** True when an SVG export embeds a raster or is simply too big to inline. */
+function svgIsBloated(bytes) {
+  if (bytes.length > SVG_MAX_BYTES) return true;
+  // Scan the raw bytes for "data:image/" without decoding the whole export.
+  const needle = "data:image/";
+  const head = needle.charCodeAt(0);
+  for (let i = 0; i + needle.length <= bytes.length; i++) {
+    if (bytes[i] !== head) continue;
+    let hit = true;
+    for (let j = 1; j < needle.length; j++) {
+      if (bytes[i + j] !== needle.charCodeAt(j)) {
+        hit = false;
+        break;
+      }
+    }
+    if (hit) return true;
+  }
+  return false;
+}
+
 /** Convert a live Figma node into the REST-shaped JSON the converter expects. */
 function serialize(node, ctx) {
-  const out = { id: node.id, name: node.name, type: node.type };
+  const out = { id: node.id, name: node.name, type: restType(node.type) };
   if (node.visible === false) out.visible = false;
+  // Shared-style names — the designer's own naming for this block's look.
+  const fillStyle = styleNameOf(node, "fillStyleId", ctx);
+  if (fillStyle) out.fillStyleName = fillStyle;
+  const strokeStyle = styleNameOf(node, "strokeStyleId", ctx);
+  if (strokeStyle) out.strokeStyleName = strokeStyle;
+  const effectStyle = styleNameOf(node, "effectStyleId", ctx);
+  if (effectStyle) out.effectStyleName = effectStyle;
   tagInteraction(node, out);
 
   const bb = node.absoluteBoundingBox;
@@ -468,6 +673,15 @@ function serialize(node, ctx) {
   // Explicit "Export as SVG" mark → the converter flattens the node to one icon.
   if (Array.isArray(node.exportSettings) && node.exportSettings.some((s) => s.format === "SVG"))
     out.svgExport = true;
+  // A mask layer clips its following siblings; the app flattens such a group
+  // into one SVG, since CSS cannot clip to an arbitrary vector.
+  if (node.isMask) out.isMask = true;
+
+  // For a rotated node absoluteBoundingBox is the AABB of the *rotated* shape,
+  // and the original size can't always be recovered from it (at 45° the
+  // equations are singular — a circle would inflate by √2). Pass the real one.
+  if (isNum(node.rotation) && Math.abs(node.rotation) > 0.001 && isNum(node.width) && isNum(node.height))
+    out.size = { x: node.width, y: node.height };
 
   if (Array.isArray(node.effects) && node.effects.length) {
     out.effects = node.effects.map((e) => ({
@@ -537,12 +751,17 @@ function serialize(node, ctx) {
   if (isNum(node.maxHeight)) out.maxHeight = node.maxHeight;
 
   if (node.type === "TEXT") {
+    // Curved / path text can't be reproduced in CSS — mark it so both this
+    // plugin (collectAssets) and the app flatten it into one SVG asset.
+    if (isCurvedText(node)) out.svgExport = true;
     out.characters = node.characters;
     out.style = textStyle(node);
     // Resize mode decides whether the text has a fixed width (wraps) or hugs.
     if (node.textAutoResize) out.textAutoResize = node.textAutoResize;
     const fsv = varNameOf(node, "fontSize", ctx, "size");
     if (fsv) out.style.fontSizeVar = fsv;
+    const tsn = styleNameOf(node, "textStyleId", ctx);
+    if (tsn) out.style.textStyleName = tsn;
     const segs = styledSegments(node);
     if (segs) out.styledSegments = segs;
     // Truncation → truncate / line-clamp-N.
@@ -565,7 +784,11 @@ function serialize(node, ctx) {
 /** Walk the serialized tree and collect the ids to export (mirrors convert.ts). */
 function collectAssets(n, acc) {
   if (isIconNode(n)) {
-    acc.push({ id: n.id, kind: "svg" });
+    // An "icon" built on a raster — a photo clipped by a vector mask — has no
+    // vectors to preserve, and the app asks for it as a PNG. Exporting SVG here
+    // would file it under assets.svg while the markup looks in assets.png, and
+    // the picture would come out with an empty src.
+    acc.push({ id: n.id, kind: subtreeHasImageFill(n) ? "png" : "svg" });
     return; // the whole icon subtree becomes one asset
   }
   if (hasImageFill(n)) {
@@ -644,7 +867,18 @@ async function run() {
     try {
       if (ref.kind === "svg") {
         const bytes = await live.exportAsync({ format: "SVG" });
-        assets.push({ id: ref.id, kind: "svg", bytes });
+        // A vector whose fills are images comes back as SVG with the whole
+        // bitmap inlined as base64 - once URI-encoded that is several times
+        // larger than the plain PNG, so ship the PNG instead.
+        if (svgIsBloated(bytes)) {
+          const raster = await live.exportAsync({
+            format: "PNG",
+            constraint: pngConstraint(live, 2048),
+          });
+          assets.push({ id: ref.id, kind: "svg", raster: true, bytes: raster });
+        } else {
+          assets.push({ id: ref.id, kind: "svg", bytes });
+        }
       } else if (ref.kind === "bg") {
         // Export the container's photo fill alone: hide direct children, snap
         // the PNG, then restore visibility (guarded so we never leave hidden).
@@ -702,6 +936,11 @@ async function run() {
 
 figma.ui.onmessage = (msg) => {
   if (msg.type === "send") run();
+  else if (msg.type === "resize") {
+    const w = clampW(msg.width), h = clampH(msg.height);
+    figma.ui.resize(w, h);
+    figma.clientStorage.setAsync("uiSize", { width: w, height: h });
+  } else if (msg.type === "saveOptions") figma.clientStorage.setAsync("options", msg.options);
   else if (msg.type === "saveEndpoint") figma.clientStorage.setAsync("endpoint", msg.endpoint);
   else if (msg.type === "close") figma.closePlugin();
 };

@@ -39,3 +39,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+.fonts/
+
+# Отладочные выгрузки Figma API
+node*.json

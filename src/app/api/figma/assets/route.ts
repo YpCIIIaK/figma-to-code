@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getImages, mapLimit, parseFigmaUrl, FigmaError } from "@/lib/figma/client";
+import { sanitizeSvg, isBloatedSvg } from "@/lib/figma/svg";
 
 export const runtime = "nodejs";
 
@@ -24,16 +25,30 @@ export async function POST(req: NextRequest) {
       // Fetch the actual SVG markup so the output is self-contained.
       // These are figma-CDN URLs (not the rate-limited API), but cap
       // concurrency so a big icon set doesn't open dozens of sockets.
+      const bloated: string[] = [];
       await mapLimit(svgIds as string[], 6, async (id) => {
         const u = res.images?.[id];
         if (!u) return;
         try {
           const r = await fetch(u);
-          if (r.ok) svg[id] = sanitizeSvg(await r.text());
+          if (!r.ok) return;
+          const markup = sanitizeSvg(await r.text());
+          // Figma inlines the whole bitmap when a vector is filled with an
+          // image; URI-encoded that dwarfs the plain PNG, so render one instead.
+          if (isBloatedSvg(markup)) bloated.push(id);
+          else svg[id] = markup;
         } catch {
           /* skip a failed icon */
         }
       });
+      if (bloated.length) {
+        const raster = await getImages(token, fileKey, bloated, "png", 2);
+        // The client treats a non-"<" value here as a ready-to-use image src.
+        for (const id of bloated) {
+          const u = raster.images?.[id];
+          if (u) svg[id] = u;
+        }
+      }
     }
 
     if (pngIds.length) {
@@ -54,11 +69,5 @@ export async function POST(req: NextRequest) {
   }
 }
 
-/** Trim Figma's XML preamble and width/height so our CSS controls sizing. */
-function sanitizeSvg(raw: string): string {
-  return raw
-    .replace(/<\?xml[^>]*\?>/i, "")
-    .replace(/<!--[\s\S]*?-->/g, "")
-    .replace(/\s(width|height)="[^"]*"/gi, "")
-    .trim();
-}
+
+
