@@ -204,6 +204,16 @@ export interface FigmaNode {
   /** internal: a full-bleed background layer the flow detector kept as an
    *  absolute overlay — must paint behind its in-flow siblings (-z-10). */
   bgLayer?: boolean;
+  /** internal: a merged elliptical background — the container gets rounded-full. */
+  roundFull?: boolean;
+  /** internal: a wrapper invented by the flow detector (a row of a stacked
+   *  layout); it has no Figma counterpart, so it is never exported as an asset. */
+  synthetic?: boolean;
+  /** internal: flow offsets from the XY-cut layout (margin-top / margin-left). */
+  flowMt?: number;
+  /** internal: overlapping, centred layers stacked in one CSS grid cell. */
+  stackCenter?: boolean;
+  flowMl?: number;
   /** "STRETCH" — fill the parent's counter axis. */
   layoutAlign?: "INHERIT" | "STRETCH" | "MIN" | "CENTER" | "MAX";
   /** > 0 — grow along the parent's primary axis. */

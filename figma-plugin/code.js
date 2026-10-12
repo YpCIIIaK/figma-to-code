@@ -862,7 +862,7 @@ async function run() {
       type: "progress",
       message: "Экспортирую ассеты " + done + "/" + assetRefs.length + "…",
     });
-    const live = figma.getNodeById(ref.id);
+    const live = await figma.getNodeByIdAsync(ref.id);
     if (!live || typeof live.exportAsync !== "function") continue;
     try {
       if (ref.kind === "svg") {

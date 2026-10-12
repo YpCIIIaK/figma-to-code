@@ -1,4 +1,5 @@
 import type {
+  AxisAlign,
   FigmaNode,
   FigmaColor,
   FigmaPaint,
@@ -322,6 +323,7 @@ function isArcEllipse(n: FigmaNode): boolean {
 
 /** A node we should export as a single SVG (an icon / illustration). */
 function isIconNode(n: FigmaNode): boolean {
+  if (n.synthetic) return false;
   if (VECTOR_TYPES.has(n.type)) return true;
   if (isArcEllipse(n)) return true;
   const container =
@@ -857,6 +859,38 @@ interface InferredFlow {
    *  folded into the container itself (the idiomatic form) instead of kept as a
    *  separate absolute layer. */
   mergeBackground?: FigmaNode;
+  /** alignment for a lone child sitting (near-)centred on its backdrop */
+  primaryAxisAlignItems?: AxisAlign;
+  counterAxisAlignItems?: AxisAlign;
+  /** overlapping centred layers: one grid cell instead of a flow */
+  stack?: boolean;
+}
+
+/**
+ * The idiomatic form: a single full-bleed background leaf IS the container's
+ * background — fold its fill/radius/stroke/shadow into the parent and drop the
+ * element, but only when the parent has no fill of its own and the layer is a
+ * plain, opaque, unrotated leaf (a genuine backdrop).
+ */
+function pickMerge(
+  node: FigmaNode,
+  backgrounds: FigmaNode[],
+): { mergeBackground?: FigmaNode; overlays: FigmaNode[] } {
+  const pbox = node.absoluteBoundingBox;
+  const b = backgrounds[0];
+  const bb = b?.absoluteBoundingBox;
+  if (
+    backgrounds.length === 1 &&
+    pbox &&
+    bb &&
+    !hasVisibleFill(node) &&
+    !b.children?.length &&
+    (b.opacity ?? 1) >= 1 &&
+    !(b.rotation && Math.abs(b.rotation) > 0.5) &&
+    bb.width * bb.height >= pbox.width * pbox.height * 0.98
+  )
+    return { mergeBackground: b, overlays: [] };
+  return { overlays: backgrounds };
 }
 
 /** Any visible paint (solid / gradient / image) that fills the node's box. */
@@ -906,6 +940,25 @@ function allClose(values: number[], tol = 3): boolean {
  * overlap, or the spacing is irregular) — in which case absolute wins.
  */
 function inferFlowLayout(node: FigmaNode): InferredFlow | null {
+  return inferSimpleFlow(node) ?? xyCutFlow(node);
+}
+
+/**
+ * A layer that only paints behind the others: covers ~all of the parent and
+ * carries no text. A container with real content (a whole section that
+ * happens to fill the selection) is content, not a backdrop.
+ */
+function isBackdrop(c: FigmaNode, parentArea: number): boolean {
+  const b = c.absoluteBoundingBox;
+  return (
+    !!b &&
+    parentArea > 0 &&
+    b.width * b.height >= parentArea * 0.9 &&
+    !subtreeHasText(c)
+  );
+}
+
+function inferSimpleFlow(node: FigmaNode): InferredFlow | null {
   const pbox = node.absoluteBoundingBox;
   const box = (c: FigmaNode) => c.absoluteBoundingBox!;
   const visible = (node.children ?? []).filter(
@@ -919,18 +972,35 @@ function inferFlowLayout(node: FigmaNode): InferredFlow | null {
   // decorative sibling, not part of the flow — set it aside as an absolute layer
   // so header/grid siblings can still be detected as a clean row/column/grid.
   const parentArea = pbox ? pbox.width * pbox.height : 0;
-  const backgrounds = visible.filter(
-    (c) => parentArea > 0 && box(c).width * box(c).height >= parentArea * 0.9,
-  );
-  const kids = visible.filter((c) => !backgrounds.includes(c));
-  // Attempt only when there were extra siblings to justify the guess.
-  if (kids.length < 2) return null;
-  if (backgrounds.length === 0 && kids.length < 3) return null;
+  let backgrounds = visible.filter((c) => isBackdrop(c, parentArea));
+  let kids = visible.filter((c) => !backgrounds.includes(c));
+  // A lone full-size layer (a photo filling its frame) is the content itself.
+  if (!kids.length && backgrounds.length === 1) {
+    kids = backgrounds;
+    backgrounds = [];
+  }
+  if (!kids.length) return null;
+  // Two loose siblings may sit anywhere (a diagonal, a corner badge) — attempt
+  // only when a backdrop or a third sibling justifies the guess. A lone child
+  // is always safe: padding reproduces its offset exactly.
+  // Two siblings are only trusted when they obviously stack (left edges
+  // aligned, one below the other) or sit side by side (tops aligned).
+  if (kids.length === 2 && backgrounds.length === 0) {
+    const [a, b] = [...kids].map(box).sort((p, q) => p.y - q.y);
+    const column = b.y >= a.y + a.height - 2 && Math.abs(a.x - b.x) <= 2;
+    const [l, r2] = [...kids].map(box).sort((p, q) => p.x - q.x);
+    const row = r2.x >= l.x + l.width - 2 && Math.abs(l.y - r2.y) <= 2;
+    if (!column && !row) return null;
+  }
 
   // Overlapping children are free-form art / stacked layers, not a flow.
-  for (let i = 0; i < kids.length; i++)
+  let overlapping = false;
+  for (let i = 0; i < kids.length && !overlapping; i++)
     for (let j = i + 1; j < kids.length; j++)
-      if (areaOverlap(box(kids[i]), box(kids[j])) > 0.25) return null;
+      if (areaOverlap(box(kids[i]), box(kids[j])) > 0.25) {
+        overlapping = true;
+        break;
+      }
 
   // Content inset from the frame edges → the container's padding.
   const minX = Math.min(...kids.map((c) => box(c).x));
@@ -949,20 +1019,7 @@ function inferFlowLayout(node: FigmaNode): InferredFlow | null {
   // container's background — fold its fill/radius/stroke/shadow into the parent
   // and drop the element, but only when the parent has no fill of its own and
   // the layer is a plain, opaque, unrotated leaf (a genuine backdrop).
-  let mergeBackground: FigmaNode | undefined;
-  let overlays = backgrounds;
-  if (
-    backgrounds.length === 1 &&
-    !hasVisibleFill(node) &&
-    !(backgrounds[0].children?.length) &&
-    (backgrounds[0].opacity ?? 1) >= 1 &&
-    !(backgrounds[0].rotation && Math.abs(backgrounds[0].rotation) > 0.5) &&
-    pbox &&
-    box(backgrounds[0]).width * box(backgrounds[0]).height >= parentArea * 0.98
-  ) {
-    mergeBackground = backgrounds[0];
-    overlays = [];
-  }
+  const { mergeBackground, overlays } = pickMerge(node, backgrounds);
   // Any remaining background layers stay as absolute overlays, pushed behind the
   // now-in-flow siblings (bgLayer → -z-10 on the container's isolated context).
   const bg = overlays.map(
@@ -971,6 +1028,67 @@ function inferFlowLayout(node: FigmaNode): InferredFlow | null {
   // Fields shared by every successful return: padding + the merge candidate.
   const extra = { ...pad, mergeBackground };
   const flow = (order: FigmaNode[]): InferredFlow["children"] => [...bg, ...order];
+
+  if (overlapping) {
+    // Layers piled on one centre (a glyph on an icon on a starburst) stack in a
+    // single grid cell, centred — no offsets at all. Anything else is real
+    // free-form art and stays absolute.
+    if (!pbox || overlays.length) return null;
+    const centred = kids.every((k) => {
+      const kb = box(k);
+      const offX = kb.x + kb.width / 2 - (pbox.x + pbox.width / 2);
+      const offY = kb.y + kb.height / 2 - (pbox.y + pbox.height / 2);
+      return (
+        Math.abs(offX) <= Math.max(3, pbox.width * 0.03) &&
+        Math.abs(offY) <= Math.max(3, pbox.height * 0.03)
+      );
+    });
+    if (!centred) return null;
+    return {
+      layoutMode: "HORIZONTAL",
+      itemSpacing: 0,
+      paddingLeft: 0,
+      paddingTop: 0,
+      paddingRight: 0,
+      paddingBottom: 0,
+      mergeBackground,
+      stack: true,
+      children: kids,
+    };
+  }
+
+  // ---- A lone child (a logo on its circle, an icon in its badge) ----
+  // Designers eyeball "centred" to within a few pixels; treat that as real
+  // centring (flex + justify/items-center) and keep the exact inset otherwise.
+  if (kids.length === 1) {
+    if (pbox) {
+      const kb = box(kids[0]);
+      const offX = kb.x + kb.width / 2 - (pbox.x + pbox.width / 2);
+      const offY = kb.y + kb.height / 2 - (pbox.y + pbox.height / 2);
+      const tolX = Math.max(3, pbox.width * 0.03);
+      const tolY = Math.max(3, pbox.height * 0.03);
+      if (Math.abs(offX) <= tolX && Math.abs(offY) <= tolY)
+        return {
+          layoutMode: "HORIZONTAL",
+          itemSpacing: 0,
+          paddingLeft: 0,
+          paddingTop: 0,
+          paddingRight: 0,
+          paddingBottom: 0,
+          mergeBackground,
+          primaryAxisAlignItems: "CENTER",
+          counterAxisAlignItems: "CENTER",
+          children: flow(kids),
+        };
+    }
+    return {
+      layoutMode: "HORIZONTAL",
+      itemSpacing: 0,
+      ...extra,
+      counterAxisAlignItems: "MIN",
+      children: flow(kids),
+    };
+  }
 
   // Cluster into rows: a child joins a row when it overlaps it vertically.
   const byTop = [...kids].sort((a, b) => box(a).y - box(b).y);
@@ -1025,7 +1143,7 @@ function inferFlowLayout(node: FigmaNode): InferredFlow | null {
         children: flow(rows.flat()),
       };
     }
-    return null;
+    // Not an aligned grid — may still be a stack of rows (below).
   }
 
   // ---- Single row ----
@@ -1043,10 +1161,374 @@ function inferFlowLayout(node: FigmaNode): InferredFlow | null {
     const g: number[] = [];
     for (let i = 1; i < rows.length; i++) g.push(tops[i] - bots[i - 1]);
     const gap = uniformGap(g);
-    if (gap != null)
-      return { layoutMode: "VERTICAL", itemSpacing: gap, ...extra, children: flow(rows.flat()) };
+    if (gap == null) return null;
+    const items = rows.flat();
+    const lefts = items.map((c) => box(c).x);
+    const centers = items.map((c) => box(c).x + box(c).width / 2);
+    if (allClose(lefts))
+      return {
+        layoutMode: "VERTICAL",
+        itemSpacing: gap,
+        ...extra,
+        counterAxisAlignItems: "MIN",
+        children: flow(items),
+      };
+    if (allClose(centers) && pbox && Math.abs(extra.paddingLeft - extra.paddingRight) <= 3)
+      return {
+        layoutMode: "VERTICAL",
+        itemSpacing: gap,
+        ...extra,
+        counterAxisAlignItems: "CENTER",
+        children: flow(items),
+      };
+    // Ragged left edges: fall through — each item becomes its own padded row.
+  }
+
+  // ---- Stack of rows (staggered / uneven rows: 3 + 3 offset, 4 + 2, …) ----
+  // Each row is a clean flex row on its own; the column of rows is a flex-col.
+  // A row's horizontal offset becomes its own left padding, so a honeycomb or
+  // a centred last row survives without pinning every item by left/top.
+  const rowBoxes = rows.map((rr) => ({
+    top: Math.min(...rr.map((c) => box(c).y)),
+    bot: Math.max(...rr.map((c) => box(c).y + box(c).height)),
+    left: Math.min(...rr.map((c) => box(c).x)),
+  }));
+  const rowGapsY: number[] = [];
+  for (let i = 1; i < rowBoxes.length; i++) rowGapsY.push(rowBoxes[i].top - rowBoxes[i - 1].bot);
+  const stackGap = uniformGap(rowGapsY);
+  if (stackGap == null) return null;
+  const rowFrames: FigmaNode[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const rr = rows[i];
+    const g = rr.length > 1 ? horizGaps(rr) : 0;
+    if (g == null) return null;
+    const rb = rowBoxes[i];
+    rowFrames.push({
+      id: `${node.id}:row${i}`,
+      name: "Row",
+      type: "FRAME",
+      synthetic: true,
+      layoutMode: "HORIZONTAL",
+      itemSpacing: g,
+      paddingLeft: rb.left - minX,
+      paddingRight: 0,
+      paddingTop: 0,
+      paddingBottom: 0,
+      counterAxisAlignItems: "MIN",
+      absoluteBoundingBox: { x: minX, y: rb.top, width: maxX - minX, height: rb.bot - rb.top },
+      children: rr,
+    } as FigmaNode);
+  }
+  return {
+    layoutMode: "VERTICAL",
+    itemSpacing: stackGap,
+    ...extra,
+    counterAxisAlignItems: "MIN",
+    children: flow(rowFrames),
+  };
+}
+
+/** Does a child cover ~all of the node (a backdrop, not a flow item)? */
+function hasBackdropChild(node: FigmaNode): boolean {
+  const pb = node.absoluteBoundingBox;
+  if (!pb || !pb.width || !pb.height) return false;
+  return (node.children ?? []).some((c) => {
+    const b = c.absoluteBoundingBox;
+    return (
+      c.visible !== false &&
+      !!b &&
+      c.layoutPositioning !== "ABSOLUTE" &&
+      isBackdrop(c, pb.width * pb.height)
+    );
+  });
+}
+
+// ---- XY-cut: free-form → nested flex bands --------------------------------
+// When the children are no clean row/column/grid, they usually still split
+// along empty lines: a band of headings on top, two text columns, a diagram
+// below. Cut where no child crosses (horizontally first, then vertically),
+// recurse into each part, and let flex + per-item margins reproduce the exact
+// offsets. Only a part no line can split stays free-form (absolute inside).
+
+type XYBox = { x: number; y: number; width: number; height: number };
+
+function unionOf(items: FigmaNode[]): XYBox {
+  const bs = items.map((c) => c.absoluteBoundingBox!);
+  const x = Math.min(...bs.map((b) => b.x));
+  const y = Math.min(...bs.map((b) => b.y));
+  const x2 = Math.max(...bs.map((b) => b.x + b.width));
+  const y2 = Math.max(...bs.map((b) => b.y + b.height));
+  return { x, y, width: x2 - x, height: y2 - y };
+}
+
+/** Split along the first axis that has an empty line crossing no item. */
+function cutOnce(
+  items: FigmaNode[],
+): { mode: "VERTICAL" | "HORIZONTAL"; parts: FigmaNode[][] } | null {
+  for (const mode of ["VERTICAL", "HORIZONTAL"] as const) {
+    const start = (c: FigmaNode) =>
+      mode === "VERTICAL" ? c.absoluteBoundingBox!.y : c.absoluteBoundingBox!.x;
+    const size = (c: FigmaNode) =>
+      mode === "VERTICAL" ? c.absoluteBoundingBox!.height : c.absoluteBoundingBox!.width;
+    const sorted = [...items].sort((a, b) => start(a) - start(b));
+    const parts: FigmaNode[][] = [];
+    let end = -Infinity;
+    for (const c of sorted) {
+      if (!parts.length || start(c) >= end - 0.5) {
+        parts.push([c]);
+        end = start(c) + size(c);
+      } else {
+        parts[parts.length - 1].push(c);
+        end = Math.max(end, start(c) + size(c));
+      }
+    }
+    if (parts.length > 1) return { mode, parts };
   }
   return null;
+}
+
+/** Offsets of each part inside a flex container spanning `ub`; a uniform
+ *  main-axis spacing becomes `gap`, anything else per-item margins. */
+function arrange(
+  mode: "VERTICAL" | "HORIZONTAL",
+  parts: FigmaNode[],
+  ub: XYBox,
+): { children: FigmaNode[]; gap: number } {
+  const v = mode === "VERTICAL";
+  const bs = parts.map((c) => c.absoluteBoundingBox!);
+  const gaps: number[] = [];
+  for (let i = 1; i < bs.length; i++)
+    gaps.push(
+      v ? bs[i].y - (bs[i - 1].y + bs[i - 1].height) : bs[i].x - (bs[i - 1].x + bs[i - 1].width),
+    );
+  const gap = uniformGap(gaps) ?? 0;
+  const children = parts.map((c, i) => {
+    const b = bs[i];
+    const main = i === 0 ? 0 : Math.max(0, gaps[i - 1] - gap);
+    const cross = v ? b.x - ub.x : b.y - ub.y;
+    return {
+      ...c,
+      flowMt: v ? main : cross,
+      flowMl: v ? cross : main,
+    } as FigmaNode;
+  });
+  return { children, gap };
+}
+
+/** One part of the cut: a single layer as is, else a synthetic wrapper. */
+function packPart(items: FigmaNode[], id: string): FigmaNode {
+  if (items.length === 1) return items[0];
+  const ub = unionOf(items);
+  const cut = cutOnce(items);
+  const base = {
+    id,
+    name: "Group",
+    type: "FRAME",
+    synthetic: true,
+    absoluteBoundingBox: ub,
+  };
+  if (!cut) return { ...base, layoutMode: "NONE", children: items } as FigmaNode;
+  const packed = cut.parts.map((p, i) => packPart(p, `${id}.${i}`));
+  const { children, gap } = arrange(cut.mode, packed, ub);
+  return {
+    ...base,
+    layoutMode: cut.mode,
+    itemSpacing: gap,
+    counterAxisAlignItems: "MIN",
+    children,
+  } as FigmaNode;
+}
+
+function xyCutFlow(node: FigmaNode): InferredFlow | null {
+  const pbox = node.absoluteBoundingBox;
+  if (!pbox) return null;
+  const visible = (node.children ?? []).filter(
+    (c) => c.visible !== false && c.absoluteBoundingBox && c.layoutPositioning !== "ABSOLUTE",
+  );
+  const area = pbox.width * pbox.height;
+  const backgrounds = visible.filter((c) => isBackdrop(c, area));
+  const kids = visible.filter((c) => !backgrounds.includes(c));
+  if (kids.length < 2) return null;
+  const cut = cutOnce(kids);
+  if (!cut) return null;
+  const ub = unionOf(kids);
+  const packed = cut.parts.map((p, i) => packPart(p, `${node.id}:xy${i}`));
+  const { children, gap } = arrange(cut.mode, packed, ub);
+  const { mergeBackground, overlays } = pickMerge(node, backgrounds);
+  const bg = overlays.map(
+    (c) => ({ ...c, layoutPositioning: "ABSOLUTE", bgLayer: true }) as FigmaNode,
+  );
+  return {
+    layoutMode: cut.mode,
+    itemSpacing: gap,
+    paddingLeft: Math.max(0, ub.x - pbox.x),
+    paddingTop: Math.max(0, ub.y - pbox.y),
+    paddingRight: Math.max(0, pbox.x + pbox.width - (ub.x + ub.width)),
+    paddingBottom: Math.max(0, pbox.y + pbox.height - (ub.y + ub.height)),
+    counterAxisAlignItems: "MIN",
+    mergeBackground,
+    // Layers the designer already took out of flow stay pinned on top.
+    children: [
+      ...bg,
+      ...children,
+      ...(node.children ?? []).filter((c) => c.layoutPositioning === "ABSOLUTE"),
+    ],
+  };
+}
+
+/**
+ * A layer that sits entirely inside a sibling container (a label laid over a
+ * section's free-form area, but kept at the top level) belongs to that
+ * container. Moving it into the deepest free-form frame that contains it keeps
+ * it on screen exactly where it was, and lets both levels flow.
+ */
+function adoptContained(node: FigmaNode): FigmaNode {
+  const within = (o: XYBox, i: XYBox) =>
+    i.x >= o.x - 1 &&
+    i.y >= o.y - 1 &&
+    i.x + i.width <= o.x + o.width + 1 &&
+    i.y + i.height <= o.y + o.height + 1;
+  const insert = (c: FigmaNode, k: FigmaNode): FigmaNode | null => {
+    const cb = c.absoluteBoundingBox;
+    const kb = k.absoluteBoundingBox!;
+    if (
+      !cb ||
+      !c.children?.length ||
+      !["FRAME", "GROUP", "INSTANCE", "COMPONENT"].includes(c.type) ||
+      c.visible === false ||
+      !within(cb, kb) ||
+      isIconNode(c) ||
+      (c.opacity ?? 1) < 1 ||
+      Math.abs(c.rotation ?? 0) >= 0.5 ||
+      (c.effects ?? []).some((e) => e.visible !== false) ||
+      (c.blendMode && c.blendMode !== "PASS_THROUGH" && c.blendMode !== "NORMAL")
+    )
+      return null;
+    for (let i = 0; i < c.children.length; i++) {
+      const r = insert(c.children[i], k);
+      if (r) return { ...c, children: c.children.map((x, j) => (j === i ? r : x)) };
+    }
+    if (!c.layoutMode || c.layoutMode === "NONE")
+      return { ...c, children: [...c.children, k] };
+    return null;
+  };
+  let kids = node.children ?? [];
+  let changed = false;
+  for (let guard = 0; guard < 16; guard++) {
+    let moved = false;
+    for (let i = 0; i < kids.length && !moved; i++) {
+      const k = kids[i];
+      if (!k.absoluteBoundingBox || k.visible === false || k.layoutPositioning === "ABSOLUTE")
+        continue;
+      // Only a host painted *below* it (earlier in z-order) keeps the stacking.
+      for (let j = 0; j < i && !moved; j++) {
+        const host = insert(kids[j], k);
+        if (host) {
+          kids = kids.filter((_, x) => x !== i).map((x, y) => (y === j ? host : x));
+          moved = changed = true;
+        }
+      }
+    }
+    if (!moved) break;
+  }
+  return changed ? { ...node, children: kids } : node;
+}
+
+/** A bare shape that paints nothing: no fill, stroke or effect. (Empty
+ *  frames stay — they may be placeholders the developer fills in.) */
+function isEmptyLeaf(n: FigmaNode): boolean {
+  if (n.visible === false) return true;
+  if (n.children?.length) return false;
+  if (!["RECTANGLE", "ELLIPSE", "GROUP"].includes(n.type))
+    return false;
+  const stroked =
+    (n.strokeWeight ?? 1) > 0 && (n.strokes ?? []).some((p) => p.visible !== false);
+  return (
+    !hasVisibleFill(n) &&
+    !stroked &&
+    !(n.effects ?? []).some((e) => e.visible !== false) &&
+    !n.svgExport
+  );
+}
+
+/**
+ * A plain-colour circle or square turned by 90° (or any shape by 180°) looks
+ * exactly the same unturned — but a rotated child blocks every flow inference
+ * and costs a rotate() plus absolute box. Drop the no-op turn.
+ */
+function dropTrivialRotation(n: FigmaNode): FigmaNode {
+  const rot = n.rotation ?? 0;
+  if (Math.abs(rot) < 0.5 || n.children?.length) return n;
+  if (!["RECTANGLE", "ELLIPSE"].includes(n.type)) return n;
+  const q = ((Math.round(rot / 90) % 4) + 4) % 4;
+  if (Math.abs(rot - Math.round(rot / 90) * 90) > 0.5) return n;
+  if ((n.fills ?? []).some((f) => f.visible !== false && f.type !== "SOLID")) return n;
+  const b = n.absoluteBoundingBox;
+  const square = !!b && Math.abs(b.width - b.height) <= 1;
+  if (q % 2 === 1 && !square) return n;
+  const radii = n.rectangleCornerRadii;
+  if (radii && !(radii[0] === radii[1] && radii[1] === radii[2] && radii[2] === radii[3])) return n;
+  return { ...n, rotation: 0, size: undefined };
+}
+
+/** A GROUP that is pure structure: no paint, effect or clipping of its own. */
+function isPlainGroup(n: FigmaNode): boolean {
+  return (
+    n.type === "GROUP" &&
+    n.visible !== false &&
+    !n.isMask &&
+    (n.opacity ?? 1) >= 1 &&
+    !(n.effects ?? []).some((e) => e.visible !== false) &&
+    (!n.blendMode || n.blendMode === "PASS_THROUGH" || n.blendMode === "NORMAL") &&
+    Math.abs(n.rotation ?? 0) < 0.5 &&
+    !hasMaskedChild(n) &&
+    !isIconNode(n)
+  );
+}
+
+/**
+ * Figma files are full of wrapper groups that exactly cover their parent
+ * (Group › Group › Ellipse). Each one is another absolute box at left-0 top-0;
+ * splicing their children into the parent (they keep absolute coordinates, so
+ * nothing moves) is what lets the flow detector see the real content.
+ */
+function unwrapCoveringGroups(node: FigmaNode): FigmaNode {
+  const pb = node.absoluteBoundingBox;
+  if (!pb || !node.children?.length) return node;
+  const covers = (c: FigmaNode) => {
+    const b = c.absoluteBoundingBox;
+    return (
+      !!b &&
+      Math.abs(b.x - pb.x) <= 1 &&
+      Math.abs(b.y - pb.y) <= 1 &&
+      Math.abs(b.width - pb.width) <= 1 &&
+      Math.abs(b.height - pb.height) <= 1
+    );
+  };
+  // Invisible leftovers (an unfilled rectangle, an image layer whose fill was
+  // switched off) paint nothing but still become absolute boxes — drop them.
+  // Safe only here: in a free-form frame they never affect anyone's position.
+  let kids = node.children.filter((c) => !isEmptyLeaf(c));
+  let changed = kids.length !== node.children.length;
+  for (let guard = 0; guard < 8; guard++) {
+    const idx = kids.findIndex(
+      (c) =>
+        isPlainGroup(c) &&
+        !!c.children?.length &&
+        // a group of one is just that one layer, wherever it sits
+        (covers(c) || c.children.filter((k) => !isEmptyLeaf(k)).length === 1),
+    );
+    if (idx < 0) break;
+    const inner = kids[idx].children!.filter((k) => !isEmptyLeaf(k));
+    kids = [...kids.slice(0, idx), ...inner, ...kids.slice(idx + 1)];
+    changed = true;
+  }
+  const turned = kids.map(dropTrivialRotation);
+  if (turned.some((k, i) => k !== kids[i])) {
+    kids = turned;
+    changed = true;
+  }
+  return changed ? { ...node, children: kids } : node;
 }
 
 /**
@@ -1132,6 +1614,12 @@ function nodeToIR(
   // element still takes up its wide, short unrotated box and lands somewhere
   // else entirely — the two axis captions swap places. Pin such a frame's
   // children by their real boxes instead.
+  if (
+    opts.inferLayout &&
+    (!node.layoutMode || node.layoutMode === "NONE") &&
+    !isIconNode(node)
+  )
+    node = adoptContained(unwrapCoveringGroups(node));
   const flowable = !(node.children ?? []).some((c) => Math.abs(c.rotation ?? 0) >= 0.5);
 
   // Opt-in: adopt Figma's inferred auto-layout for a free-form frame so the
@@ -1142,6 +1630,9 @@ function nodeToIR(
     opts.inferLayout &&
     flowable &&
     node.inferredLayout &&
+    // Figma reads a backdrop (a circle behind a logo) as just another item in
+    // its row; our detector folds it into the container's background instead.
+    !hasBackdropChild(node) &&
     (!node.layoutMode || node.layoutMode === "NONE") &&
     node.children &&
     node.children.length > 1
@@ -1173,10 +1664,29 @@ function nodeToIR(
     flowable &&
     (!node.layoutMode || node.layoutMode === "NONE") &&
     node.children &&
-    node.children.length > 2
+    node.children.length > 0 &&
+    !isIconNode(node)
   ) {
     const flow = inferFlowLayout(node);
-    if (flow) {
+    if (flow?.stack) {
+      node = { ...node, stackCenter: true, children: flow.children };
+      const b = flow.mergeBackground;
+      if (b)
+        node = {
+          ...node,
+          fills: b.fills,
+          cornerRadius: b.cornerRadius,
+          cornerRadiusVar: b.cornerRadiusVar,
+          rectangleCornerRadii: b.rectangleCornerRadii,
+          strokes: b.strokes,
+          strokeWeight: b.strokeWeight,
+          strokeAlign: b.strokeAlign,
+          strokeDashes: b.strokeDashes,
+          individualStrokeWeights: b.individualStrokeWeights,
+          effects: node.effects ?? b.effects,
+          roundFull: b.type === "ELLIPSE" || node.roundFull,
+        };
+    } else if (flow) {
       node = {
         ...node,
         layoutMode: flow.layoutMode,
@@ -1187,6 +1697,8 @@ function nodeToIR(
         paddingRight: flow.paddingRight,
         paddingTop: flow.paddingTop,
         paddingBottom: flow.paddingBottom,
+        primaryAxisAlignItems: flow.primaryAxisAlignItems ?? node.primaryAxisAlignItems,
+        counterAxisAlignItems: flow.counterAxisAlignItems ?? node.counterAxisAlignItems,
         children: flow.children,
       };
       // Fold a full-bleed background leaf into the container itself (fill /
@@ -1206,6 +1718,7 @@ function nodeToIR(
           strokeDashes: b.strokeDashes,
           individualStrokeWeights: b.individualStrokeWeights,
           effects: node.effects ?? b.effects,
+          roundFull: b.type === "ELLIPSE" || node.roundFull,
         };
       }
     }
@@ -1267,6 +1780,7 @@ function nodeToIR(
     opts.absolutePositioning &&
     parent &&
     (!parentAuto || absInAuto) &&
+    !parent.stackCenter &&
     box &&
     bbox(parent)
   ) {
@@ -1317,7 +1831,12 @@ function nodeToIR(
   }
 
   // ---- Auto-layout → flex ----
-  if (isAutoLayout) {
+  // Stacked layers: one grid cell, every layer centred in it.
+  if (node.stackCenter && !exported) cls.push("grid", "place-items-center");
+  if (parent?.stackCenter) cls.push("col-start-1", "row-start-1");
+
+  // An exported <img> has no flow children — layout classes would be noise.
+  if (isAutoLayout && !exported) {
     cls.push("flex");
     if (node.layoutMode === "VERTICAL") cls.push("flex-col");
     if (node.layoutWrap === "WRAP") cls.push("flex-wrap");
@@ -1354,12 +1873,16 @@ function nodeToIR(
     } else if (pl || pr || pt || pb) {
       if (pl === pr && pt === pb && pl === pt) cls.push(`p-[${pl}px]`);
       else {
-        if (pl === pr) cls.push(`px-[${pl}px]`);
+        if (pl === pr) {
+          if (pl) cls.push(`px-[${pl}px]`);
+        }
         else {
           if (pl) cls.push(`pl-[${pl}px]`);
           if (pr) cls.push(`pr-[${pr}px]`);
         }
-        if (pt === pb) cls.push(`py-[${pt}px]`);
+        if (pt === pb) {
+          if (pt) cls.push(`py-[${pt}px]`);
+        }
         else {
           if (pt) cls.push(`pt-[${pt}px]`);
           if (pb) cls.push(`pb-[${pb}px]`);
@@ -1419,6 +1942,9 @@ function nodeToIR(
   if (parentAuto && !absInAuto) {
     const mainAxisFill = rowParent ? fillW : fillH;
     if (!mainAxisFill) cls.push("shrink-0");
+    // XY-cut offsets: exact placement inside a flex band without left/top.
+    if (node.flowMt && r(node.flowMt)) cls.push(`mt-[${r(node.flowMt)}px]`);
+    if (node.flowMl && r(node.flowMl)) cls.push(`ml-[${r(node.flowMl)}px]`);
   }
 
   if (geo && (!isText || curvedText)) {
@@ -1463,7 +1989,7 @@ function nodeToIR(
   // the drawing instead.
   if (isArcEllipse(node)) {
     /* nothing: see arcShapes */
-  } else if (node.type === "ELLIPSE") cls.push("rounded-full");
+  } else if (node.type === "ELLIPSE" || node.roundFull) cls.push("rounded-full");
   else if (node.cornerRadius)
     cls.push(node.cornerRadiusVar ? `rounded-${node.cornerRadiusVar}` : `rounded-[${r(node.cornerRadius)}px]`);
   else if (node.rectangleCornerRadii) {
@@ -1525,6 +2051,7 @@ function nodeToIR(
   if (
     opts.absolutePositioning &&
     !isAutoLayout &&
+    !node.stackCenter &&
     node.children?.length &&
     !isText &&
     !cls.includes("absolute")
@@ -2281,6 +2808,10 @@ function twDecls(
     if (c === "absolute") d.position = "absolute";
     else if (c === "relative") d.position = "relative";
     else if (c === "flex") d.display = "flex";
+    else if (c === "grid") d.display = "grid";
+    else if (c === "place-items-center") d["place-items"] = "center";
+    else if (c === "col-start-1") d["grid-column-start"] = "1";
+    else if (c === "row-start-1") d["grid-row-start"] = "1";
     else if (c === "flex-col") d["flex-direction"] = "column";
     else if (c === "flex-wrap") d["flex-wrap"] = "wrap";
     else if (c === "grow") d["flex-grow"] = "1";
@@ -2349,6 +2880,8 @@ function twDecls(
     else if (arb && c.startsWith("pr-[")) d["padding-right"] = arb;
     else if (arb && c.startsWith("pb-[")) d["padding-bottom"] = arb;
     else if (arb && c.startsWith("pl-[")) d["padding-left"] = arb;
+    else if (arb && c.startsWith("mt-[")) d["margin-top"] = arb;
+    else if (arb && c.startsWith("ml-[")) d["margin-left"] = arb;
     else if (arb && c.startsWith("rounded-[")) d["border-radius"] = arb;
     else if (arb && c.startsWith("rounded-tl-[")) d["border-top-left-radius"] = arb;
     else if (arb && c.startsWith("rounded-tr-[")) d["border-top-right-radius"] = arb;

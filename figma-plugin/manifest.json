@@ -1,6 +1,7 @@
 {
   "name": "Figma Copy — Send to app",
-  "id": "figma-copy-companion",
+  "id": "1681674041915123935",
+  "documentAccess": "dynamic-page",
   "api": "1.0.0",
   "main": "code.js",
   "ui": "ui.html",

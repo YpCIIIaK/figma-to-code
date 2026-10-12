@@ -62,7 +62,7 @@ export function generate(body: GenerateBody): GenerateResult {
     absolutePositioning: true,
     useTokens: !!body.useTokens,
     semantic: body.semantic !== false,
-    inferLayout: !!body.inferLayout,
+    inferLayout: body.inferLayout !== false,
     responsive: !!body.responsive,
     layerNames: !!body.layerNames,
     // Figma variables (plugin payload) — token mode names colours/spacing

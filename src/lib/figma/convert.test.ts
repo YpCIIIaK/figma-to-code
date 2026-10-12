@@ -1745,3 +1745,247 @@ describe("converter: layer & style names", () => {
     expect(jsx).toContain(".map(");
   });
 });
+
+describe("free-form → flex (fewer absolute boxes)", () => {
+  const white = [{ type: "SOLID", color: { r: 1, g: 1, b: 1, a: 1 } }] as FigmaNode["fills"];
+  // A logo on a white circle, wrapped in two redundant full-size groups.
+  const badge = (i: number, x: number, y: number, dx = 0, dy = 0): FigmaNode => ({
+    id: `b${i}`,
+    name: `Group ${i}`,
+    type: "GROUP",
+    absoluteBoundingBox: box(237, 237, x, y),
+    children: [
+      {
+        id: `g${i}`,
+        name: "Inner",
+        type: "GROUP",
+        absoluteBoundingBox: box(237, 237, x, y),
+        children: [
+          { id: `e${i}`, name: "Ellipse", type: "ELLIPSE", fills: white, absoluteBoundingBox: box(237, 237, x, y) },
+          {
+            id: `v${i}`,
+            name: "logo",
+            type: "GROUP",
+            absoluteBoundingBox: box(160, 60, x + 38.5 + dx, y + 88.5 + dy),
+            children: [
+              { id: `p${i}`, name: "path", type: "VECTOR", absoluteBoundingBox: box(160, 60, x + 38.5 + dx, y + 88.5 + dy) },
+            ],
+          },
+        ],
+      },
+    ],
+  });
+
+  it("turns staggered rows of logo badges into flex rows without left/top", () => {
+    const content = frame({
+      name: "Content",
+      absoluteBoundingBox: box(1158, 498),
+      children: [
+        badge(1, 553, 0, 1, 4),
+        badge(2, 921, 0),
+        badge(3, 369, 261, 0, 6),
+        badge(4, 737, 261),
+        badge(5, 185, 0),
+        badge(6, 0, 261),
+      ],
+    });
+    const { code } = convertNode(content, { absolutePositioning: true, inferLayout: true });
+    expect(code).not.toMatch(/\babsolute\b/);
+    expect(code).not.toMatch(/left-\[|top-\[/);
+    expect(code).toContain("flex-col");
+    expect(code).toContain("gap-[24px]");
+    expect(code).toContain("pl-[185px]");
+    expect(code).toContain("rounded-full");
+    expect(code).toContain("justify-center");
+    // The wrapper groups are gone: no leftover full-size boxes.
+    expect(code).not.toContain('data-name="Inner"');
+  });
+
+  it("ignores Figma's inferred row when a child is a backdrop", () => {
+    const b = badge(7, 0, 0, 1, 4);
+    const inner = b.children![0];
+    const g: FigmaNode = {
+      ...b,
+      children: inner.children,
+      inferredLayout: { layoutMode: "HORIZONTAL", counterAxisAlignItems: "CENTER" },
+    };
+    const { code } = convertNode(g, { absolutePositioning: true, inferLayout: true });
+    expect(code).toContain("rounded-full");
+    expect(code).toContain("justify-center");
+    expect(code).not.toContain('data-name="Ellipse"');
+    expect(code).not.toMatch(/\babsolute\b/);
+  });
+
+  it("stacks a heading above its content instead of pinning both", () => {
+    const sel = frame({
+      name: "Selection",
+      type: "GROUP",
+      absoluteBoundingBox: box(1340, 356),
+      children: [
+        frame({ id: "h", name: "Heading", absoluteBoundingBox: box(1340, 24, 0, 0) }),
+        frame({ id: "c", name: "Content", absoluteBoundingBox: box(1340, 289, 0, 67) }),
+      ],
+    });
+    const { code } = convertNode(sel, { absolutePositioning: true, inferLayout: true });
+    expect(code).toContain("flex-col");
+    expect(code).toContain("gap-[43px]");
+    expect(code).not.toMatch(/\babsolute\b/);
+  });
+
+  it("places two diagonal siblings by margins, not left/top", () => {
+    const n = frame({
+      absoluteBoundingBox: box(400, 400),
+      children: [
+        frame({ id: "a", absoluteBoundingBox: box(100, 100, 0, 0) }),
+        frame({ id: "b", absoluteBoundingBox: box(100, 100, 250, 250) }),
+      ],
+    });
+    const { code } = convertNode(n, { absolutePositioning: true, inferLayout: true });
+    expect(code).not.toMatch(/\babsolute\b/);
+    expect(code).toContain("ml-[250px]");
+    expect(code).toContain("gap-[150px]");
+  });
+
+  it("cuts a free-form section into bands and keeps absolute only in the diagram", () => {
+    const text = (id: string, x: number, y: number, w: number, h: number): FigmaNode => ({
+      id, name: id, type: "TEXT", characters: id, absoluteBoundingBox: box(w, h, x, y),
+    });
+    const content = frame({
+      id: "content",
+      name: "Content",
+      absoluteBoundingBox: box(1340, 582, 0, 91),
+      children: [
+        frame({ id: "l1", name: "Label1", layoutMode: "HORIZONTAL", absoluteBoundingBox: box(455, 52, 0, 91), children: [text("t1", 20, 103, 415, 28)] }),
+        frame({ id: "l2", name: "Label2", layoutMode: "HORIZONTAL", absoluteBoundingBox: box(217, 52, 730, 91), children: [text("t2", 750, 103, 177, 28)] }),
+        text("p1", 0, 145, 610, 44),
+        text("p2", 730, 145, 610, 22),
+        // diagram: overlapping circles and lines
+        frame({ id: "c1", name: "Circle1", absoluteBoundingBox: box(225, 225, 56, 278) }),
+        frame({ id: "c2", name: "Circle2", absoluteBoundingBox: box(225, 225, 365, 363) }),
+        { id: "ln", name: "Line", type: "VECTOR", absoluteBoundingBox: box(1, 444, 0, 228) },
+        { id: "ln2", name: "Line2", type: "VECTOR", absoluteBoundingBox: box(365, 1, 0, 588) },
+      ],
+    });
+    const label = frame({
+      id: "l3", name: "Label3", layoutMode: "HORIZONTAL",
+      absoluteBoundingBox: box(363, 52, 0, 228), children: [text("t3", 20, 240, 323, 28)],
+    });
+    const sel = frame({
+      id: "sel", name: "Selection", type: "GROUP",
+      absoluteBoundingBox: box(1340, 673),
+      children: [
+        frame({
+          id: "sec", name: "Section", layoutMode: "VERTICAL", itemSpacing: 43,
+          absoluteBoundingBox: box(1340, 673),
+          children: [text("h", 0, 0, 600, 48), content],
+        }),
+        label,
+      ],
+    });
+    const { code } = convertNode(sel, { absolutePositioning: true, inferLayout: true });
+    // The label moved into Content; no -z-10 backdrop hack at the top.
+    expect(code).not.toContain("-z-10");
+    // Headings band flows; the two text columns are side by side via flex.
+    expect(code).not.toMatch(/absolute left-\[730px\]/);
+    expect(code).not.toMatch(/absolute left-\[0px\] top-\[54px\]/);
+    // The overlapping diagram is still free-form.
+    expect(code).toMatch(/\babsolute\b/);
+  });
+
+  it("drops empty layers and one-child groups inside a free-form frame", () => {
+    const n = frame({
+      id: "land",
+      name: "Landing",
+      absoluteBoundingBox: box(377, 265),
+      clipsContent: true,
+      children: [
+        { id: "r", name: "Rectangle 2421", type: "RECTANGLE", cornerRadius: 10, absoluteBoundingBox: box(377, 265) },
+        {
+          id: "g", name: "Group 8443", type: "GROUP", absoluteBoundingBox: box(377, 284),
+          children: [
+            { id: "e", name: "image 156", type: "RECTANGLE", rotation: 90, absoluteBoundingBox: box(293, 183, 42, 50) },
+            {
+              id: "img", name: "laptop", type: "RECTANGLE",
+              fills: [{ type: "IMAGE", scaleMode: "FILL" }] as FigmaNode["fills"],
+              absoluteBoundingBox: box(377, 284),
+            },
+          ],
+        },
+      ],
+    });
+    const { code } = convertNode(n, { absolutePositioning: true, inferLayout: true });
+    expect(code).not.toMatch(/\babsolute\b/);
+    expect(code).not.toContain("Rectangle 2421");
+    expect(code).not.toContain("image 156");
+    expect(code).toContain("<img");
+  });
+
+  it("ignores a no-op 90° turn on a circle and centres the logo", () => {
+    const g: FigmaNode = {
+      id: "g8424", name: "Group 8424", type: "GROUP", absoluteBoundingBox: box(100, 100),
+      children: [
+        {
+          id: "g8312", name: "Group 8312", type: "GROUP", absoluteBoundingBox: box(100, 100),
+          children: [
+            {
+              id: "r1182", name: "Rectangle 1182", type: "RECTANGLE", rotation: 90, cornerRadius: 294,
+              fills: [{ type: "SOLID", color: { r: 0.1, g: 0.1, b: 0.1, a: 1 } }] as FigmaNode["fills"],
+              absoluteBoundingBox: box(100, 100),
+            },
+          ],
+        },
+        { id: "logo", name: "logo", type: "GROUP", absoluteBoundingBox: box(69, 11, 16, 44), children: [{ id: "logov", name: "v", type: "VECTOR", absoluteBoundingBox: box(69, 11, 16, 44) }] },
+      ],
+    };
+    const { code } = convertNode(g, { absolutePositioning: true, inferLayout: true });
+    expect(code).not.toMatch(/\babsolute\b/);
+    expect(code).not.toContain("rotate-");
+    expect(code).toContain("rounded-[294px]");
+    expect(code).toContain("justify-center");
+  });
+
+  it("drops an empty group next to a logo", () => {
+    const g: FigmaNode = {
+      id: "g8429", name: "Group 8429", type: "GROUP", absoluteBoundingBox: box(100, 100),
+      children: [
+        { id: "e", name: "Group 8312", type: "GROUP", absoluteBoundingBox: box(100, 100), children: [] },
+        { id: "logo", name: "logo", type: "VECTOR", absoluteBoundingBox: box(72, 21, 14, 39.5) },
+      ],
+    };
+    const { code } = convertNode(g, { absolutePositioning: true, inferLayout: true });
+    expect(code).not.toMatch(/\babsolute\b/);
+    expect(code).not.toContain("Group 8312");
+  });
+
+  it("stacks centred overlapping layers in one grid cell", () => {
+    const orange = [{ type: "SOLID", color: { r: 1, g: 0.4, b: 0, a: 1 } }] as FigmaNode["fills"];
+    const card = frame({
+      id: "land", name: "Landing", absoluteBoundingBox: box(317, 223),
+      children: [
+        { id: "bg", name: "Rectangle 2421", type: "RECTANGLE", cornerRadius: 8, fills: orange, absoluteBoundingBox: box(317, 223) },
+        { id: "burst", name: "burst", type: "GROUP", absoluteBoundingBox: box(223, 223, 47, 0), children: [{ id: "burstv", name: "v", type: "VECTOR", absoluteBoundingBox: box(223, 223, 47, 0) }] },
+        { id: "icon", name: "icon", type: "GROUP", absoluteBoundingBox: box(69, 101, 125, 61), children: [{ id: "iconv", name: "v", type: "VECTOR", absoluteBoundingBox: box(69, 101, 125, 61) }] },
+      ],
+    });
+    const { code, cssModule } = convertNode(card, { absolutePositioning: true, inferLayout: true });
+    expect(code).not.toMatch(/\babsolute\b/);
+    expect(code).toContain("grid place-items-center");
+    expect(code).toContain("col-start-1 row-start-1");
+    expect(code).toContain("rounded-[8px]");
+    expect(cssModule.css ?? JSON.stringify(cssModule)).toContain("place-items");
+  });
+
+  it("never puts flex classes on an exported <img>", () => {
+    const icon = frame({
+      id: "i1",
+      name: "logo",
+      layoutMode: "VERTICAL",
+      itemSpacing: 15,
+      absoluteBoundingBox: box(154, 100),
+      children: [{ id: "i2", name: "v", type: "VECTOR", absoluteBoundingBox: box(50, 50) }],
+    });
+    const { code } = convertNode(icon, { absolutePositioning: true });
+    expect(code).toContain("<img");
+    expect(code).not.toContain("flex-col");
+  });
+});

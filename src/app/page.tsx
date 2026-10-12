@@ -43,7 +43,7 @@ export default function Home() {
   const [semantic, setSemantic] = useState(true);
   // Turn Figma's inferred auto-layout on free-form frames into flex (opt-in:
   // changes absolute-positioned output into flow layout, so off by default).
-  const [inferLayout, setInferLayout] = useState(false);
+  const [inferLayout, setInferLayout] = useState(true);
   // Fluid root (w-full + max-w) so the block adapts to narrow viewports (opt-in).
   const [responsive, setResponsive] = useState(false);
   // Keep the Figma layer / style names in the markup as data-name / data-style.
