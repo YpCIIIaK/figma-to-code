@@ -2055,3 +2055,161 @@ describe("free-form → flex (fewer absolute boxes)", () => {
     expect(code).not.toContain("flex-col");
   });
 });
+
+describe("interactive states (prototype hover / press)", () => {
+  const solid = (r: number, g: number, b: number) => [{ type: "SOLID", color: { r, g, b, a: 1 } }];
+  const label = (color: [number, number, number], x = 0) =>
+    ({
+      id: "t",
+      name: "Label",
+      type: "TEXT",
+      characters: "Купить",
+      absoluteBoundingBox: box(60, 20, x + 20, 14),
+      style: { fontSize: 14, fontWeight: 700, lineHeightPx: 20 },
+      fills: solid(...color),
+    }) as unknown as FigmaNode;
+  const button = (over: Partial<FigmaNode>) =>
+    frame({
+      id: "b",
+      name: "Button",
+      layoutMode: "HORIZONTAL",
+      paddingLeft: 20,
+      paddingRight: 20,
+      paddingTop: 14,
+      paddingBottom: 14,
+      absoluteBoundingBox: box(100, 48),
+      fills: solid(1, 1, 1),
+      children: [label([0, 0, 0])],
+      ...over,
+    });
+
+  // The variant lives elsewhere on the canvas — position must not leak into the diff.
+  const hoverVariant = button({
+    id: "v",
+    absoluteBoundingBox: box(100, 48, 900, 500),
+    fills: solid(0, 0, 0),
+    children: [label([1, 1, 1], 900)],
+  });
+  const btn = button({
+    interactiveStates: [
+      { trigger: "hover", node: hoverVariant, transition: { duration: 300, easing: "cubic-bezier(0,0,0.58,1)" } },
+    ],
+  });
+
+  it("emits only the changed utilities, prefixed, with Figma's timing", () => {
+    const { html } = convertNode(btn);
+    expect(html).toContain("hover:bg-[#000000]");
+    expect(html).toContain("group-hover:text-[#ffffff]");
+    expect(html).toMatch(/class="[^"]*\bgroup\b/);
+    expect(html).toContain("duration-[300ms]");
+    expect(html).toContain("ease-out");
+    expect(html).not.toMatch(/hover:(left|top|w|h|p[xy]?)-/);
+  });
+
+  it("maps press to active:", () => {
+    const n = button({ interactiveStates: [{ trigger: "press", node: hoverVariant }] });
+    expect(convertNode(n).html).toContain("active:bg-[#000000]");
+  });
+
+  it("writes :hover rules in the CSS-modules output", () => {
+    const css = convertNode(btn).cssModule.css;
+    expect(css).toMatch(/:hover \{[^}]*background/);
+    expect(css).toMatch(/:hover \.\w+ \{[^}]*color/);
+    expect(css).toContain("transition-duration: 300ms");
+  });
+
+  it("leaves a node without states untouched", () => {
+    expect(convertNode(button({})).html).not.toContain("hover:");
+  });
+});
+
+describe("auto animation (After delay → Change to)", () => {
+  const dot = (opacity: number, x = 0) =>
+    ({
+      id: "d",
+      name: "Dot",
+      type: "FRAME",
+      absoluteBoundingBox: box(10, 10, x, 0),
+      fills: [{ type: "SOLID", color: { r: 1, g: 1, b: 1, a: 1 } }],
+      ...(opacity < 1 ? { opacity } : {}),
+    }) as unknown as FigmaNode;
+  const loader = (steps: NonNullable<FigmaNode["autoAnimation"]>["steps"], loops: boolean) =>
+    frame({
+      id: "l",
+      name: "Loader",
+      layoutMode: "HORIZONTAL",
+      absoluteBoundingBox: box(10, 10),
+      children: [dot(1)],
+      autoAnimation: { steps, loops },
+    });
+  const dim = frame({ id: "v", name: "Loader", layoutMode: "HORIZONTAL", absoluteBoundingBox: box(10, 10, 500, 0), children: [dot(0.2, 500)] });
+
+  it("turns a looping chain into infinite keyframes on the changing element", () => {
+    const n = loader(
+      [
+        { delay: 500, duration: 300, easing: "cubic-bezier(0,0,0.58,1)", node: dim },
+        { delay: 500, duration: 300, node: null },
+      ],
+      true,
+    );
+    const { html, code } = convertNode(n);
+    expect(html).toContain("<style>");
+    expect(html).toMatch(/@keyframes fx-1 \{[\s\S]*opacity: 0\.2/);
+    expect(html).toContain("animate-[fx-1_1600ms_linear_infinite]");
+    // 500ms hold of 1600ms → the first move starts at 31.25%
+    expect(html).toContain("31.25% { opacity: 1; animation-timing-function: cubic-bezier(0,0,0.58,1); }");
+    expect(code).toContain("<style>{`");
+  });
+
+  it("plays a one-way chain once and stays on the last state", () => {
+    const n = loader([{ delay: 0, duration: 400, node: dim }], false);
+    const { html } = convertNode(n);
+    expect(html).toContain("animate-[fx-1_400ms_linear_1_forwards]");
+    expect(html).toMatch(/100% \{ opacity: 0\.2;/);
+  });
+
+  it("puts the keyframes into the CSS module", () => {
+    const n = loader([{ delay: 0, duration: 400, node: dim }], false);
+    const { cssModule } = convertNode(n);
+    expect(cssModule.css).toContain("@keyframes fx-1");
+    expect(cssModule.css).toContain("animation: fx-1 400ms linear 1 forwards");
+  });
+});
+
+describe("auto animation: spinner made of rotated variants", () => {
+  // An arc exported as SVG, turned 90° per variant (Figma keeps -180..180).
+  const arc = (rotation: number, x: number) =>
+    ({
+      id: `arc${x}`,
+      name: "Ellipse 6",
+      type: "ELLIPSE",
+      rotation,
+      svgExport: true,
+      absoluteBoundingBox: box(rotation % 180 ? 100 : 100, 100, x, 0),
+      strokes: [{ type: "SOLID", color: { r: 1, g: 1, b: 1, a: 1 } }],
+    }) as unknown as FigmaNode;
+  const variant = (rotation: number, x: number) =>
+    frame({ id: `v${x}`, name: "loading", layoutMode: "HORIZONTAL", absoluteBoundingBox: box(100, 100, x, 0), children: [arc(rotation, x)] });
+  const step = (node: FigmaNode | null) => ({ delay: 1, duration: 300, easing: "linear", node });
+
+  it("spins one full turn per cycle instead of tweening the box", () => {
+    const n = frame({
+      id: "l",
+      name: "loading",
+      layoutMode: "HORIZONTAL",
+      absoluteBoundingBox: box(100, 100),
+      children: [arc(0, 0)],
+      autoAnimation: {
+        loops: true,
+        steps: [step(variant(90, 200)), step(variant(180, 400)), step(variant(-90, 600)), step(null)],
+      },
+    });
+    const { html } = convertNode(n);
+    const kf = html.match(/@keyframes fx-1 \{[\s\S]*?\n\}/)?.[0] ?? "";
+    expect(kf).toContain("rotate: 0deg");
+    expect(kf).toContain("rotate: 90deg");
+    expect(kf).toContain("rotate: 270deg");
+    expect(kf).toMatch(/100% \{ rotate: 360deg; \}/);
+    expect(kf).not.toMatch(/\b(left|top|width|height):/);
+  });
+});

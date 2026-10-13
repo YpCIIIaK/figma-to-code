@@ -121,10 +121,12 @@ export function generate(body: GenerateBody): GenerateResult {
           const dataUri = markup ? `data:image/svg+xml,${encodeURIComponent(markup)}` : "";
           res = res.replace(`@@ASSET:${a.id}@@`, dataUri);
         } else if (markup) {
-          const svgWithClass = markup.replace(/<svg\b/, `<svg class="${a.className}"`);
+          // Take the class from the <img> being replaced, not from the asset
+          // record: hover:/animate- utilities are added after the asset was
+          // registered, and an inline <svg> without them never moves.
           res = res.replace(
-            new RegExp(`<img class="[^"]*"[^>]*?src="@@ASSET:${a.id}@@"[^>]*/>`),
-            svgWithClass,
+            new RegExp(`<img class="([^"]*)"[^>]*?src="@@ASSET:${a.id}@@"[^>]*/>`),
+            (_m, cls: string) => markup.replace(/<svg\b/, `<svg class="${cls || a.className}"`),
           );
         }
       } else {

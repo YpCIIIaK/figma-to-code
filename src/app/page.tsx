@@ -271,13 +271,11 @@ export default function Home() {
               : "";
             res = res.replace(`@@ASSET:${a.id}@@`, dataUri);
           } else if (markup) {
-            const svgWithClass = markup.replace(
-              /<svg\b/,
-              `<svg class="${a.className}"`,
-            );
+            // The <img>'s own class, not the asset record's: hover:/animate-
+            // utilities are added after the asset was registered.
             res = res.replace(
-              new RegExp(`<img class="[^"]*"[^>]*?src="@@ASSET:${a.id}@@"[^>]*/>`),
-              svgWithClass,
+              new RegExp(`<img class="([^"]*)"[^>]*?src="@@ASSET:${a.id}@@"[^>]*/>`),
+              (_m, cls: string) => markup.replace(/<svg\b/, `<svg class="${cls || a.className}"`),
             );
           }
         } else {

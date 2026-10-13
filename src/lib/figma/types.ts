@@ -138,6 +138,11 @@ export interface FigmaNode {
   href?: string;
   /** Has a navigation/click reaction with no URL → real <button>. */
   clickable?: boolean;
+  /** "While hovering / pressing → Change to <variant>": the target variant,
+   *  serialized by the plugin, plus the prototype transition timing. */
+  interactiveStates?: InteractiveState[];
+  /** "After delay → Change to" chain starting at this node (plugin). */
+  autoAnimation?: AutoAnimation;
 
   // Auto-layout min/max sizing (Figma "min width" / "max width" etc.).
   minWidth?: number;
@@ -270,4 +275,18 @@ export interface TreeNode {
   name: string;
   type: string;
   children?: TreeNode[];
+}
+
+export interface InteractiveState {
+  trigger: "hover" | "press";
+  node: FigmaNode;
+  /** duration in ms; easing as a CSS timing function */
+  transition?: { duration: number; easing?: string };
+}
+
+export interface AutoAnimation {
+  /** each hop: hold the current state `delay` ms, then move to `node` over
+   *  `duration` ms; node null = back to the first state (a loop) */
+  steps: { delay: number; duration: number; easing?: string; node: FigmaNode | null }[];
+  loops: boolean;
 }

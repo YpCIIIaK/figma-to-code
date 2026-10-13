@@ -18,6 +18,7 @@ export interface AssetRef {
 }
 
 type IRTag =
+  | "style"
   | "div"
   | "span"
   | "p"
@@ -59,6 +60,10 @@ interface IRElement {
   asset?: { id: string; kind: "svg" | "png" };
   /** set when we draw the shape ourselves (arc / donut segment) */
   svg?: { viewBox: string; shapes: SvgShape[] };
+  /** raw CSS of a <style> element (generated @keyframes) */
+  raw?: string;
+  /** id of the Figma node this element came from (state diffing) */
+  srcId?: string;
 }
 
 /** One drawn path inside a generated <svg> (see arcShapes). */
@@ -96,6 +101,8 @@ export interface ConvertOptions {
   layerNames?: boolean;
   /** internal: shared sink for conversion warnings (lossy / unsupported cases) */
   warnings?: string[];
+  /** internal: shared sink for generated @keyframes rules */
+  keyframes?: string[];
 }
 
 interface TokenMaps {
@@ -1581,8 +1588,288 @@ function warn(opts: ConvertOptions, node: FigmaNode, msg: string): void {
   opts.warnings?.push(`${node.name || node.type}: ${msg}`);
 }
 
-/** Convert one Figma node (and its subtree) into an IR element. */
+// ---- Interactive states (hover / press) ------------------------------------
+// A prototype "While hovering → Change to <variant>" becomes hover: utilities:
+// both states are converted the same way and only the classes that differ are
+// emitted, prefixed (hover: on the element itself, group-hover: on its
+// descendants), with a transition carrying Figma's duration and easing.
+
+const STATE_PREFIX = { hover: ["hover:", "group-hover:"], press: ["active:", "group-active:"] } as const;
+
+/** Utility family of a class ("bg-[#fff]" → "bg", "opacity-[0.8]" → "opacity"). */
+function utilityOf(c: string): string {
+  const i = c.indexOf("-[");
+  if (i > 0) return c.slice(0, i);
+  return c.replace(/-[^-]+$/, "");
+}
+
+/** What a class "turns off" to when the other state simply doesn't have it. */
+const RESET: Record<string, string> = {
+  opacity: "opacity-100",
+  shadow: "shadow-none",
+  blur: "blur-none",
+  "backdrop-blur": "backdrop-blur-none",
+  underline: "no-underline",
+  rotate: "rotate-0",
+  scale: "scale-100",
+};
+
+/** Move the variant subtree onto the base element's position, and give its
+ *  root the base's place in the parent (sizing mode, constraints…): only the
+ *  visual difference between the two states should survive the diff. */
+function alignState(state: FigmaNode, base: FigmaNode): FigmaNode {
+  const sb = state.absoluteBoundingBox;
+  const bb = base.absoluteBoundingBox;
+  const dx = sb && bb ? bb.x - sb.x : 0;
+  const dy = sb && bb ? bb.y - sb.y : 0;
+  const shift = (n: FigmaNode): FigmaNode => ({
+    ...n,
+    ...(n.absoluteBoundingBox
+      ? { absoluteBoundingBox: { ...n.absoluteBoundingBox, x: n.absoluteBoundingBox.x + dx, y: n.absoluteBoundingBox.y + dy } }
+      : {}),
+    ...(n.absoluteRenderBounds
+      ? { absoluteRenderBounds: { ...n.absoluteRenderBounds, x: n.absoluteRenderBounds.x + dx, y: n.absoluteRenderBounds.y + dy } }
+      : {}),
+    interactiveStates: undefined,
+    children: n.children?.map(shift),
+  });
+  return {
+    ...shift(state),
+    layoutPositioning: base.layoutPositioning,
+    constraints: base.constraints,
+    layoutSizingHorizontal: base.layoutSizingHorizontal,
+    layoutSizingVertical: base.layoutSizingVertical,
+    layoutGrow: base.layoutGrow,
+    layoutAlign: base.layoutAlign,
+    flowMt: base.flowMt,
+    flowMl: base.flowMl,
+    bgLayer: base.bgLayer,
+    href: base.href,
+    clickable: base.clickable,
+  };
+}
+
+/** Add the prefixed differences of `to` over `from`; true when anything changed. */
+function diffState(
+  from: IRElement,
+  to: IRElement,
+  prefix: string,
+  transition: string[],
+  opts: ConvertOptions,
+  node: FigmaNode,
+  stateName: string,
+): boolean {
+  if (from.tag !== to.tag || !!from.asset !== !!to.asset) return false;
+  const have = new Set(from.classes);
+  const want = new Set(to.classes);
+  const added = to.classes.filter((c) => !have.has(c));
+  const addedFamilies = new Set(added.map(utilityOf));
+  const out = added.map((c) => prefix + c);
+  for (const c of from.classes) {
+    if (want.has(c)) continue;
+    const fam = utilityOf(c);
+    if (!addedFamilies.has(fam) && RESET[fam]) out.push(prefix + RESET[fam]);
+  }
+  const styleChanged = Object.keys({ ...from.style, ...to.style }).some((k) => from.style[k] !== to.style[k]);
+  if (styleChanged)
+    warn(opts, node, `состояние ${stateName}: инлайн-стили (градиент и т.п.) не переносятся`);
+  let changed = out.length > 0;
+  if (changed) from.classes.push(...out, ...transition);
+  const n = Math.min(from.children.length, to.children.length);
+  for (let i = 0; i < n; i++) {
+    if (from.children[i].name !== to.children[i].name) continue;
+    const childPrefix = prefix.startsWith("group-") ? prefix : `group-${prefix}`;
+    if (diffState(from.children[i], to.children[i], childPrefix, transition, opts, node, stateName))
+      changed = true;
+  }
+  return changed;
+}
+
+function transitionClasses(t?: { duration: number; easing?: string }): string[] {
+  if (!t || !t.duration) return ["transition-all"];
+  const out = ["transition-all", `duration-[${t.duration}ms]`];
+  const named: Record<string, string> = {
+    linear: "ease-linear",
+    "cubic-bezier(0.42,0,1,1)": "ease-in",
+    "cubic-bezier(0,0,0.58,1)": "ease-out",
+    "cubic-bezier(0.42,0,0.58,1)": "ease-in-out",
+  };
+  if (t.easing) out.push(named[t.easing] ?? `ease-[${t.easing.replace(/\s+/g, "")}]`);
+  return out;
+}
+
+// ---- Auto animation ("After delay → Change to" chains) ----------------------
+// Every state of the chain is converted like the element itself; elements that
+// differ between states get one @keyframes rule over the whole cycle: each
+// state is held for its delay, then eases into the next over the transition.
+
+/** Pair up elements of two IR trees by position (same name at each step). */
+function pairElements(a: IRElement, b: IRElement, out: Map<IRElement, IRElement>): void {
+  if (a.tag !== b.tag) return;
+  out.set(a, b);
+  const n = Math.min(a.children.length, b.children.length);
+  for (let i = 0; i < n; i++)
+    if (a.children[i].name === b.children[i].name) pairElements(a.children[i], b.children[i], out);
+}
+
+function walkIR(el: IRElement, fn: (e: IRElement) => void): void {
+  fn(el);
+  el.children.forEach((c) => walkIR(c, fn));
+}
+
+const pct = (v: number) => `${+v.toFixed(2)}%`;
+
+/** What an unset property amounts to, so a state that omits it still has a
+ *  frame value to tween from (opacity 1 is never written out, for instance). */
+const PROP_DEFAULT: Record<string, string> = {
+  opacity: "1",
+  transform: "none",
+  translate: "none",
+  rotate: "none",
+  scale: "none",
+  filter: "none",
+  "backdrop-filter": "none",
+  "box-shadow": "none",
+  "background-color": "transparent",
+  "mix-blend-mode": "normal",
+};
+
+/** Properties that can't tween (layout mode, stacking) — left out of frames. */
+const STATIC_PROP = /^(display|flex|justify|align|gap|position|overflow|z-index|isolation|object-fit|place)/;
+
+function applyAutoAnimation(
+  el: IRElement,
+  node: FigmaNode,
+  parent: FigmaNode | null,
+  opts: ConvertOptions,
+): void {
+  const anim = node.autoAnimation!;
+  const quiet = { ...opts, warnings: [] as string[], keyframes: [] as string[] };
+  // states[0] is the element itself; a looping chain's last step returns to it.
+  const states: IRElement[] = [el];
+  for (const st of anim.steps) {
+    if (!st.node) continue;
+    const ir = nodeToIRBase(alignState(st.node, node), parent, quiet, []);
+    if (!ir) return;
+    states.push(ir);
+  }
+  if (states.length < 2) return;
+  const maps = states.slice(1).map((s) => {
+    const m = new Map<IRElement, IRElement>();
+    pairElements(el, s, m);
+    return m;
+  });
+
+  // Timeline: hold state i for steps[i].delay, then move over steps[i].duration.
+  const segs = anim.steps.map((s) => ({ hold: s.delay, move: s.duration || 1, easing: s.easing }));
+  const total = segs.reduce((t, s) => t + s.hold + s.move, 0) || 1;
+  const stops: { state: number; at: number; easing?: string }[] = [];
+  let t = 0;
+  segs.forEach((sg, i) => {
+    const state = Math.min(i, states.length - 1);
+    stops.push({ state, at: t / total });
+    t += sg.hold;
+    stops.push({ state, at: t / total, easing: sg.easing });
+    t += sg.move;
+  });
+  // The cycle ends on the next state: back on the first when it loops (as an
+  // extra "home" entry, index states.length, so a spinner can end a turn on).
+  stops.push({ state: anim.loops ? states.length : states.length - 1, at: 1 });
+
+  // Rotation is read from the Figma nodes, not the CSS: an exported icon has its
+  // turn baked into the picture, so between states only its bounding box
+  // "changes" — tweening that box makes the spinner jump instead of turn.
+  const rotOf = new Map<string, number>();
+  const collect = (n: FigmaNode) => {
+    rotOf.set(n.id, n.rotation ?? 0);
+    n.children?.forEach(collect);
+  };
+  collect(node);
+  anim.steps.forEach((st) => st.node && collect(alignState(st.node, node)));
+
+  const declsOf = (e?: IRElement): Record<string, string> =>
+    e ? { ...twDecls(e.classes.filter((c) => !c.includes(":"))), ...e.style } : {};
+  const idBase = (opts.keyframes?.length ?? 0) + 1;
+  let n = 0;
+  walkIR(el, (target) => {
+    if (maps.some((m) => !m.has(target))) return; // missing in some state
+    const per = states.map((_, i) => (i === 0 ? declsOf(target) : declsOf(maps[i - 1].get(target))));
+    const els = states.map((_, i) => (i === 0 ? target : maps[i - 1].get(target)!));
+    const angles = els.map((e) => rotOf.get(e.srcId ?? "") ?? 0);
+    if (angles.some((a) => Math.abs(a - angles[0]) > 0.5)) {
+      // Unwrap so every hop takes the short way round (Figma's Smart Animate
+      // does): 0 → 90 → 180 → 270 → back to 0 keeps turning to 360.
+      const turn: number[] = [0];
+      for (let i = 1; i < angles.length; i++) {
+        let d = angles[i] - angles[i - 1];
+        d = ((((d + 180) % 360) + 360) % 360) - 180;
+        turn.push(turn[i - 1] + d);
+      }
+      let closing = angles[0] - angles[angles.length - 1];
+      closing = ((((closing + 180) % 360) + 360) % 360) - 180;
+      const full = turn[turn.length - 1] + closing;
+      // Same direction as the static rotate-[…deg] the converter emits. An
+      // exported picture already shows its base turn, so animate relative to it.
+      const baked = !!target.asset;
+      const base = baked ? 0 : angles[0];
+      per.forEach((d, i) => {
+        for (const k of ["left", "top", "right", "bottom", "width", "height", "translate", "transform"]) delete d[k];
+        d.rotate = `${+(base + turn[i]).toFixed(2)}deg`;
+      });
+      // A loop that comes home ends one full turn on, not by spinning back.
+      if (anim.loops) per.push({ ...per[0], rotate: `${+(base + full).toFixed(2)}deg` });
+    }
+    // Loops end on a copy of the first state ("home", see the last stop).
+    if (anim.loops && per.length === states.length) per.push({ ...per[0] });
+    const props = new Set<string>();
+    for (const d of per.slice(1))
+      for (const k of new Set([...Object.keys(d), ...Object.keys(per[0])]))
+        if (d[k] !== per[0][k] && !STATIC_PROP.test(k)) props.add(k);
+    if (!props.size) return;
+    const name = `fx-${idBase + n++}`;
+    const frames = stops.map((s) => {
+      const d = per[s.state];
+      const body = [...props]
+        .filter((k) => (d[k] ?? PROP_DEFAULT[k]) != null)
+        .map((k) => `${k}: ${d[k] ?? PROP_DEFAULT[k]};`)
+        .concat(s.easing ? [`animation-timing-function: ${s.easing};`] : [])
+        .join(" ");
+      return `  ${pct(s.at * 100)} { ${body} }`;
+    });
+    opts.keyframes?.push(`@keyframes ${name} {\n${frames.join("\n")}\n}`);
+    target.classes.push(
+      `animate-[${name}_${Math.round(total)}ms_linear_${anim.loops ? "infinite" : "1_forwards"}]`,
+    );
+  });
+}
+
+/** Convert one Figma node (and its subtree) into an IR element, with its
+ *  hover / press variants folded in as prefixed utilities. */
 function nodeToIR(
+  node: FigmaNode,
+  parent: FigmaNode | null,
+  opts: ConvertOptions,
+  assets: AssetRef[],
+): IRElement | null {
+  const el = nodeToIRBase(node, parent, opts, assets);
+  if (el && node.autoAnimation) applyAutoAnimation(el, node, parent, opts);
+  if (!el || !node.interactiveStates?.length) return el;
+  for (const st of node.interactiveStates) {
+    const quiet = { ...opts, warnings: [] as string[] };
+    const other = nodeToIRBase(alignState(st.node, node), parent, quiet, []);
+    if (!other) continue;
+    const [self, group] = STATE_PREFIX[st.trigger];
+    diffState(el, other, self, transitionClasses(st.transition), opts, node, st.trigger);
+    // Descendants react through group-hover:, which needs the marker class.
+    const usesGroup = (e: IRElement): boolean =>
+      e.children.some((c) => c.classes.some((k) => k.startsWith(group)) || usesGroup(c));
+    if (usesGroup(el) && !el.classes.includes("group")) el.classes.push("group");
+  }
+  return el;
+}
+
+/** Convert one Figma node (and its subtree) into an IR element. */
+function nodeToIRBase(
   node: FigmaNode,
   parent: FigmaNode | null,
   opts: ConvertOptions,
@@ -1598,6 +1885,7 @@ function nodeToIR(
     // A component instance's name (e.g. "Button") makes for far better class /
     // component identifiers than an anonymous "Frame 12".
     name: node.componentName || node.name,
+    srcId: node.id,
   };
   // A rotated container whose children are placed by their absolute boxes: the
   // turn is already baked into those coordinates, so we drop it here and fold
@@ -2661,6 +2949,7 @@ function serializeMappedChildren(children: IRElement[], indent: number): string 
 
 function serialize(el: IRElement, indent: number): string {
   const pad = "  ".repeat(indent);
+  if (el.raw != null) return `${pad}<style>{\`${el.raw}\`}</style>`;
   // INSTANCE_SWAP slot → a ReactNode prop stands in for the whole subtree.
   if (el.slotProp) return `${pad}{${el.slotProp}}`;
   // BOOLEAN prop → render the element only when the prop is truthy.
@@ -2787,6 +3076,7 @@ function escapeHtml(t: string): string {
 
 function serializeHtml(el: IRElement, indent: number): string {
   const pad = "  ".repeat(indent);
+  if (el.raw != null) return `${pad}<style>\n${el.raw}\n${pad}</style>`;
   const className = el.classes.length ? ` class="${el.classes.join(" ")}"` : "";
   const style = styleToHtml(el.style);
   const attrs = attrsStr(el.attrs);
@@ -2855,7 +3145,18 @@ function twDecls(
     const m = /\[(.+)\]$/.exec(c);
     const arb = m ? m[1] : null;
     // static utilities
-    if (c === "absolute") d.position = "absolute";
+    if (c === "transition-all") {
+      d["transition-property"] = "all";
+      d["transition-duration"] ??= "150ms";
+      d["transition-timing-function"] ??= "cubic-bezier(0.4,0,0.2,1)";
+    } else if (c.startsWith("duration-[")) d["transition-duration"] = arb!;
+    else if (c.startsWith("animate-[")) d.animation = arb!.replace(/_/g, " ");
+    else if (c === "ease-linear") d["transition-timing-function"] = "linear";
+    else if (c === "ease-in") d["transition-timing-function"] = "cubic-bezier(0.4,0,1,1)";
+    else if (c === "ease-out") d["transition-timing-function"] = "cubic-bezier(0,0,0.2,1)";
+    else if (c === "ease-in-out") d["transition-timing-function"] = "cubic-bezier(0.4,0,0.2,1)";
+    else if (c.startsWith("ease-[")) d["transition-timing-function"] = arb!;
+    else if (c === "absolute") d.position = "absolute";
     else if (c === "relative") d.position = "relative";
     else if (c === "flex") d.display = "flex";
     else if (c === "grid") d.display = "grid";
@@ -3030,21 +3331,52 @@ interface CssModCtx {
   used: Set<string>;
   rules: string[];
   theme?: PreviewTheme | null;
+  /** class name of the nearest ancestor marked `group` (for group-hover:) */
+  group?: string;
 }
+
+const STATE_SELECTORS: [prefix: string, pseudo: string, viaGroup: boolean][] = [
+  ["hover:", ":hover", false],
+  ["active:", ":active", false],
+  ["group-hover:", ":hover", true],
+  ["group-active:", ":active", true],
+];
 
 /** Serialize one IR element to JSX that references CSS-module class names. */
 function serializeCssMod(el: IRElement, indent: number, ctx: CssModCtx): string {
   const pad = "  ".repeat(indent);
-  const decls = { ...twDecls(el.classes, ctx.theme), ...el.style };
+  if (el.raw != null) {
+    // A module scopes the keyframe names together with the classes using them.
+    ctx.rules.push(el.raw);
+    return `${pad}{/* @keyframes — в .module.css */}`;
+  }
+  const decls = { ...twDecls(el.classes.filter((c) => !c.includes(":")), ctx.theme), ...el.style };
+  // hover: / active: / group-hover: utilities → their own pseudo-class rules.
+  const stateRules = STATE_SELECTORS.map(([prefix, pseudo, viaGroup]) => ({
+    pseudo,
+    viaGroup,
+    decls: twDecls(
+      el.classes.filter((c) => c.startsWith(prefix)).map((c) => c.slice(prefix.length)),
+      ctx.theme,
+    ),
+  })).filter((r) => Object.keys(r.decls).length && (!r.viaGroup || ctx.group));
+  const isGroup = el.classes.includes("group");
   let classAttr = "";
-  if (Object.keys(decls).length) {
-    const name = cssIdent(el.name || el.tag, ctx.used);
-    const body = Object.entries(decls)
-      .map(([k, v]) => `  ${k}: ${v};`)
-      .join("\n");
-    ctx.rules.push(`.${name} {\n${body}\n}`);
+  let name: string | undefined;
+  if (Object.keys(decls).length || stateRules.length || isGroup) {
+    name = cssIdent(el.name || el.tag, ctx.used);
+    const body = (d: Record<string, string>) =>
+      Object.entries(d)
+        .map(([k, v]) => `  ${k}: ${v};`)
+        .join("\n");
+    ctx.rules.push(`.${name} {\n${body(decls)}\n}`);
+    for (const r of stateRules) {
+      const sel = r.viaGroup ? `.${ctx.group}${r.pseudo} .${name}` : `.${name}${r.pseudo}`;
+      ctx.rules.push(`${sel} {\n${body(r.decls)}\n}`);
+    }
     classAttr = ` className={styles.${name}}`;
   }
+  if (isGroup && name) ctx = { ...ctx, group: name };
   const attrs = attrsStr(el.attrs);
 
   if (el.svg) {
@@ -3169,8 +3501,11 @@ export function convertNodes(
   const vues: string[] = [];
   const roots: Root[] = [];
   for (const n of nodes) {
-    const ir = nodeToIR(n, null, opts, assets);
+    const keyframes: string[] = [];
+    const ir = nodeToIR(n, null, { ...opts, keyframes }, assets);
     if (!ir) continue;
+    if (keyframes.length)
+      ir.children.unshift({ tag: "style", classes: [], style: {}, children: [], name: "keyframes", raw: keyframes.join("\n") });
     let name = pascalCase(n.name || "FigmaComponent");
     let unique = name;
     let i = 2;
@@ -3266,7 +3601,13 @@ export function convertNode(
   }
 
   const assets: AssetRef[] = [];
+  const keyframes: string[] = opts.keyframes ?? [];
+  opts = { ...opts, keyframes };
   const ir = nodeToIR(node, null, opts, assets);
+  // Generated @keyframes travel with the component as a <style> element, so
+  // the JSX / HTML / Vue output and the live preview need no extra CSS file.
+  if (ir && keyframes.length)
+    ir.children.unshift({ tag: "style", classes: [], style: {}, children: [], name: "keyframes", raw: keyframes.join("\n") });
   if (!ir) {
     const empty = `export default function ${componentName}() {\n  return null;\n}\n`;
     return {

@@ -209,9 +209,153 @@ function hasImageFill(n) {
 
 // A prototype reaction (OPEN_URL / navigate) is a far more reliable signal of a
 // real link/button than guessing from the layer name — surface it to the app.
+// Figma easing → CSS timing function. Springs have no CSS equivalent; an
+// ease-out curve is the closest single-curve stand-in.
+const EASING_CSS = {
+  LINEAR: "linear",
+  EASE_IN: "cubic-bezier(0.42,0,1,1)",
+  EASE_OUT: "cubic-bezier(0,0,0.58,1)",
+  EASE_IN_AND_OUT: "cubic-bezier(0.42,0,0.58,1)",
+  EASE_IN_BACK: "cubic-bezier(0.3,-0.05,0.7,-0.5)",
+  EASE_OUT_BACK: "cubic-bezier(0.45,1.45,0.8,1)",
+  EASE_IN_AND_OUT_BACK: "cubic-bezier(0.7,-0.4,0.4,1.4)",
+  GENTLE: "cubic-bezier(0.25,1,0.5,1)",
+  QUICK: "cubic-bezier(0.2,0.9,0.3,1)",
+  BOUNCY: "cubic-bezier(0.34,1.56,0.64,1)",
+  SLOW: "cubic-bezier(0.16,1,0.3,1)",
+};
+
+function easingCss(e) {
+  if (!e) return undefined;
+  if (e.type === "CUSTOM_CUBIC_BEZIER" && e.easingFunctionCubicBezier) {
+    const b = e.easingFunctionCubicBezier;
+    return "cubic-bezier(" + [b.x1, b.y1, b.x2, b.y2].map((v) => +v.toFixed(3)).join(",") + ")";
+  }
+  return EASING_CSS[e.type];
+}
+
+/** "While hovering / pressing → Change to <variant>" → a pending state ref,
+ *  resolved to the serialized variant after the tree is built (resolveStates). */
+function tagStates(node, out) {
+  const rs = node.reactions;
+  if (!Array.isArray(rs)) return;
+  for (const rx of rs) {
+    const t = rx.trigger && rx.trigger.type;
+    const trigger = t === "ON_HOVER" || t === "MOUSE_ENTER" ? "hover" : t === "ON_PRESS" ? "press" : null;
+    if (!trigger) continue;
+    const acts = rx.actions || (rx.action ? [rx.action] : []);
+    for (const a of acts) {
+      if (!a || a.type !== "NODE" || a.navigation !== "CHANGE_TO" || !a.destinationId) continue;
+      const tr = a.transition;
+      (out._stateRefs = out._stateRefs || []).push({
+        trigger,
+        destinationId: a.destinationId,
+        transition: tr
+          ? { duration: Math.round((tr.duration || 0) * 1000), easing: easingCss(tr.easing) }
+          : undefined,
+      });
+    }
+  }
+}
+
+/** First "After delay → Change to" reaction of a live node, if any. */
+function timeoutChange(node) {
+  for (const rx of node.reactions || []) {
+    if (!rx.trigger || rx.trigger.type !== "AFTER_TIMEOUT") continue;
+    const acts = rx.actions || (rx.action ? [rx.action] : []);
+    for (const a of acts) {
+      if (a && a.type === "NODE" && a.navigation === "CHANGE_TO" && a.destinationId) {
+        const tr = a.transition;
+        return {
+          delay: Math.round((rx.trigger.timeout || 0) * 1000),
+          destinationId: a.destinationId,
+          duration: tr ? Math.round((tr.duration || 0) * 1000) : 0,
+          easing: tr ? easingCss(tr.easing) : undefined,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+/** "After delay → Change to" chains (A → B → … → A loops) → autoAnimation:
+ *  the ordered variant states with their hold times and transitions. */
+async function resolveAutoAnimations(root, ctx) {
+  const pending = [];
+  (function walk(n) {
+    if (n._autoRef) pending.push(n);
+    for (const c of n.children || []) walk(c);
+  })(root);
+  for (const n of pending) {
+    const first = n._autoRef;
+    delete n._autoRef;
+    const live = await figma.getNodeByIdAsync(n.id);
+    // The chain comes back to the *variant* this instance shows, not the instance.
+    let homeId = n.id;
+    if (live && live.type === "INSTANCE") {
+      const mc = await live.getMainComponentAsync();
+      if (mc) homeId = mc.id;
+    }
+    const steps = [];
+    const seen = new Set([homeId, n.id]);
+    let hop = first;
+    let loops = false;
+    while (hop && steps.length < 8) {
+      if (seen.has(hop.destinationId)) {
+        loops = true;
+        steps.push({ delay: hop.delay, duration: hop.duration, easing: hop.easing, node: null });
+        break;
+      }
+      seen.add(hop.destinationId);
+      const dest = await figma.getNodeByIdAsync(hop.destinationId);
+      if (!dest) break;
+      const node = serialize(dest, ctx);
+      (function strip(x) {
+        delete x._stateRefs;
+        delete x._autoRef;
+        for (const c of x.children || []) strip(c);
+      })(node);
+      steps.push({ delay: hop.delay, duration: hop.duration, easing: hop.easing, node });
+      hop = timeoutChange(dest);
+    }
+    if (steps.some((s) => s.node)) n.autoAnimation = { steps, loops };
+  }
+}
+
+/** Swap each pending state ref for the serialized destination variant. */
+async function resolveStates(root, ctx) {
+  const pending = [];
+  (function walk(n) {
+    if (n._stateRefs) pending.push(n);
+    for (const c of n.children || []) walk(c);
+  })(root);
+  for (const n of pending) {
+    const states = [];
+    for (const ref of n._stateRefs) {
+      if (states.some((s) => s.trigger === ref.trigger)) continue;
+      const dest = await figma.getNodeByIdAsync(ref.destinationId);
+      if (!dest) continue;
+      const node = serialize(dest, ctx);
+      // A variant's own reactions (mouse-leave back to default) are not states
+      // of *this* element — drop them so nothing nests.
+      (function strip(x) {
+        delete x._stateRefs;
+        delete x._autoRef;
+        for (const c of x.children || []) strip(c);
+      })(node);
+      states.push({ trigger: ref.trigger, node, transition: ref.transition });
+    }
+    delete n._stateRefs;
+    if (states.length) n.interactiveStates = states;
+  }
+}
+
 function tagInteraction(node, out) {
   const rs = node.reactions;
   if (!Array.isArray(rs) || !rs.length) return;
+  tagStates(node, out);
+  const auto = timeoutChange(node);
+  if (auto) out._autoRef = auto;
   // OPEN_URL anywhere → a real <a href>.
   for (const rx of rs) {
     const acts = rx.actions || (rx.action ? [rx.action] : []);
@@ -811,6 +955,40 @@ function collectAssets(n, acc) {
 }
 
 /**
+ * Figma crops an SVG export to what is visibly drawn. For a partial ellipse (a
+ * loader arc) that is just the arc, so the picture's centre is not the circle's
+ * centre — a spinner then wobbles round the wrong axis. Re-frame the export as
+ * a square centred on the ellipse centre, big enough for the whole stroke.
+ */
+function centerArcSvg(live, bytes) {
+  try {
+    const arc = live.type === "ELLIPSE" && live.arcData;
+    if (!arc || Math.abs(arc.endingAngle - arc.startingAngle) >= Math.PI * 2 - 0.01) return bytes;
+    const rb = live.absoluteRenderBounds;
+    const t = live.absoluteTransform;
+    if (!rb || !t) return bytes;
+    const cx = t[0][0] * live.width / 2 + t[0][1] * live.height / 2 + t[0][2];
+    const cy = t[1][0] * live.width / 2 + t[1][1] * live.height / 2 + t[1][2];
+    const R = Math.max(
+      cx - rb.x, rb.x + rb.width - cx, cy - rb.y, rb.y + rb.height - cy,
+      live.width / 2, live.height / 2,
+    );
+    const vb = [cx - R - rb.x, cy - R - rb.y, 2 * R, 2 * R].map((v) => +v.toFixed(3)).join(" ");
+    const text = String.fromCharCode.apply(null, Array.from(bytes));
+    const out = text.replace(/<svg\b[^>]*>/, (tag) =>
+      tag
+        .replace(/\s(width|height|viewBox)="[^"]*"/g, "")
+        .replace(/<svg\b/,'<svg width="' + 2 * R + '" height="' + 2 * R + '" viewBox="' + vb + '"'),
+    );
+    const enc = new Uint8Array(out.length);
+    for (let i = 0; i < out.length; i++) enc[i] = out.charCodeAt(i) & 0xff;
+    return enc;
+  } catch (e) {
+    return bytes;
+  }
+}
+
+/**
  * 2x export, but capped at maxPx on the longest side — uncapped 2x PNGs of
  * wide sections (maps, hero photos) blow the app's 25 MB ingest limit (413).
  */
@@ -885,6 +1063,9 @@ async function run() {
     };
   }
 
+  await resolveStates(node, ctx);
+  await resolveAutoAnimations(node, ctx);
+
   const assetRefs = [];
   collectAssets(node, assetRefs);
 
@@ -911,7 +1092,7 @@ async function run() {
           });
           assets.push({ id: ref.id, kind: "svg", raster: true, bytes: raster });
         } else {
-          assets.push({ id: ref.id, kind: "svg", bytes });
+          assets.push({ id: ref.id, kind: "svg", bytes: centerArcSvg(live, bytes) });
         }
       } else if (ref.kind === "bg") {
         // Export the container's own fills without its children. Never hide the
