@@ -377,6 +377,23 @@ function isImagePaint(f: FigmaPaint): boolean {
   return f.visible !== false && (f.type === "IMAGE" || f.type === "VIDEO");
 }
 
+/**
+ * Absolutely-positioned children of an auto-layout frame that sit *below* the
+ * first in-flow child in Figma's layer order (blurred glows, backdrop
+ * pictures). CSS paints any positioned box above non-positioned flow content
+ * regardless of DOM order, so left alone these backdrops veil the whole
+ * section; they get bgLayer (-z-10 in an isolated parent) instead.
+ */
+function backdropChildren(node: FigmaNode): Set<FigmaNode> {
+  const out = new Set<FigmaNode>();
+  if (node.layoutMode !== "HORIZONTAL" && node.layoutMode !== "VERTICAL") return out;
+  const kids = (node.children ?? []).filter((c) => c.visible !== false);
+  const firstFlow = kids.findIndex((c) => c.layoutPositioning !== "ABSOLUTE");
+  if (firstFlow <= 0) return out;
+  for (const c of kids.slice(0, firstFlow)) out.add(c);
+  return out;
+}
+
 /** Does anything in this subtree paint a bitmap (photo / video fill)? */
 function subtreeHasImageFill(n: FigmaNode): boolean {
   if (hasImageFill(n)) return true;
@@ -1742,7 +1759,16 @@ function nodeToIR(
       (!isTextNode && hasImageFill(node) && !node.children?.length));
 
   // Everything else keeps its un-rotated rectangle and gets a `rotate()` below.
-  const geo = box && rotDeg && !exported ? unrotatedRect(box, rotDeg, node.size) : box;
+  // An exported line (arrow, divider) has no width of its own; its picture is
+  // as wide as the stroke and arrowheads, so size the <img> by that.
+  const rb = node.absoluteRenderBounds;
+  const lineExport =
+    exported && box && rb && (box.width < 0.5 || box.height < 0.5) && rb.width >= 0.5 && rb.height >= 0.5;
+  const geo = lineExport
+    ? rb
+    : box && rotDeg && !exported
+      ? unrotatedRect(box, rotDeg, node.size)
+      : box;
   // unrotatedRect returns the AABB unchanged when it can't invert the rotation
   // (a non-square node at ~45°, with no exact size from the plugin) — position
   // and size may be off there; note it rather than fail silently.
@@ -1907,7 +1933,8 @@ function nodeToIR(
       cls.push("relative");
     // A background layer sits at -z-10; isolate keeps that stacking local so it
     // paints behind the in-flow siblings without slipping under outer content.
-    if ((node.children ?? []).some((c) => c.bgLayer)) cls.push("isolate");
+    if ((node.children ?? []).some((c) => c.bgLayer) || backdropChildren(node).size)
+      cls.push("isolate");
   }
 
   // ---- Size ----
@@ -1956,19 +1983,34 @@ function nodeToIR(
     const hairline = (v: number) => v < 0.5;
     const w = hairline(geo.width) ? node.strokeWeight || 1 : geo.width;
     const h = hairline(geo.height) ? node.strokeWeight || 1 : geo.height;
+    // An exported <img> has no content to hug — without explicit w/h it falls
+    // back to the SVG's intrinsic size, which often isn't the canvas size.
     const hugW =
-      node.layoutSizingHorizontal === "HUG" ||
+      !exported &&
+      (node.layoutSizingHorizontal === "HUG" ||
       (isAutoLayout &&
         (node.layoutMode === "HORIZONTAL"
           ? node.primaryAxisSizingMode === "AUTO"
-          : node.counterAxisSizingMode === "AUTO"));
+          : node.counterAxisSizingMode === "AUTO")));
     const hugH =
-      node.layoutSizingVertical === "HUG" ||
+      !exported &&
+      (node.layoutSizingVertical === "HUG" ||
       (isAutoLayout &&
         (node.layoutMode === "VERTICAL"
           ? node.primaryAxisSizingMode === "AUTO"
-          : node.counterAxisSizingMode === "AUTO"));
-    if (!fillW && !hugW && !constraintNoW) cls.push(`w-[${r(w)}px]`);
+          : node.counterAxisSizingMode === "AUTO")));
+    // A fixed-width child that spans its column parent's full inner width is,
+    // in effect, "fill": pinning the px value makes it drift from its FILL
+    // siblings as soon as the parent is wider or narrower than on the canvas.
+    const pbox = parent && bbox(parent);
+    const spansColumn =
+      !exported &&
+      parent?.layoutMode === "VERTICAL" &&
+      !absInAuto &&
+      !!pbox &&
+      Math.abs(pbox.width - (parent.paddingLeft ?? 0) - (parent.paddingRight ?? 0) - geo.width) < 0.5;
+    if (!fillW && !hugW && !constraintNoW && spansColumn) cls.push("w-full");
+    else if (!fillW && !hugW && !constraintNoW) cls.push(`w-[${r(w)}px]`);
     if (!fillH && !hugH && !constraintNoH) cls.push(`h-[${r(h)}px]`);
   }
 
@@ -2067,7 +2109,10 @@ function nodeToIR(
     );
     const img = fills.find(isImagePaint);
     const solidPaint = firstSolidPaint(fills);
-    if (grads.length) {
+    // A photo fill wins over gradients stacked with it: the plugin exports the
+    // node's own fills composited (children hidden), so the gradient overlay is
+    // already baked into that picture — emitting only the gradient lost the photo.
+    if (grads.length && !img) {
       // A diamond gradient has no CSS equivalent — the closest match is a
       // radial one, so flag it as lossy. (Angular maps exactly to conic.)
       for (const grad of grads)
@@ -2315,8 +2360,10 @@ function nodeToIR(
         node,
         "векторная маска не воспроизводится в CSS — слои отрисованы без обрезки",
       );
+    const backdrops = backdropChildren(node);
     for (const child of node.children) {
-      const c = nodeToIR(child, node, opts, assets);
+      const src = backdrops.has(child) ? ({ ...child, bgLayer: true } as FigmaNode) : child;
+      const c = nodeToIR(src, node, opts, assets);
       if (c) el.children.push(c);
     }
   }
@@ -2361,6 +2408,9 @@ function nodeToIR(
       } else if (node.clickable || isButtonNode(node)) {
         el.tag = "button";
         el.attrs = { ...el.attrs, type: "button" };
+        // Browsers centre text inside <button>; a Figma card turned button
+        // keeps its copy left-aligned (centred labels carry text-center).
+        if (subtreeHasText(node)) el.classes.push("text-left");
       } else if (isLinkNode(node)) {
         el.tag = "a";
         el.attrs = { ...el.attrs, href: "#" };

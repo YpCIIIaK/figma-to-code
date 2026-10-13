@@ -554,6 +554,11 @@ function serialize(node, ctx) {
 
   const bb = node.absoluteBoundingBox;
   if (bb) out.absoluteBoundingBox = { x: bb.x, y: bb.y, width: bb.width, height: bb.height };
+  // A bare line has a zero-width box, but its export carries the stroke (and
+  // arrowheads) — the app sizes the <img> from these render bounds instead.
+  const rb = node.absoluteRenderBounds;
+  if (rb && bb && (bb.width < 0.5 || bb.height < 0.5))
+    out.absoluteRenderBounds = { x: rb.x, y: rb.y, width: rb.width, height: rb.height };
   const bvars = node.boundVariables || {};
 
   let fills = node.fills;
@@ -841,13 +846,42 @@ async function run() {
       x = Math.min(x, b.x); y = Math.min(y, b.y);
       x2 = Math.max(x2, b.x + b.width); y2 = Math.max(y2, b.y + b.height);
     }
+    const box = { x, y, width: x2 - x, height: y2 - y };
+    // Picking a few blocks out of a page loses whatever painted behind them —
+    // the page frame's own fill and the glow/stripe layers stacked under them.
+    // When they share a parent, bring that backdrop along: the parent's fills
+    // and every unselected sibling below them that overlaps the selection.
+    const parent = sel[0].parent;
+    const sameParent = parent && sel.every((s) => s.parent === parent) && "children" in parent;
+    let ordered = sel.slice();
+    let backdrop = [];
+    let fills;
+    if (sameParent) {
+      const kids = parent.children;
+      ordered.sort((a, b) => kids.indexOf(a) - kids.indexOf(b)); // z-order, not click order
+      const lowest = kids.indexOf(ordered[0]);
+      backdrop = kids.slice(0, lowest).filter((c) => {
+        const b = c.absoluteBoundingBox;
+        return (
+          c.visible && b &&
+          b.x < box.x + box.width && b.x + b.width > box.x &&
+          b.y < box.y + box.height && b.y + b.height > box.y
+        );
+      });
+      // Image fills would need an export of the parent itself — keep only the
+      // paints CSS can draw (solid / gradients).
+      if (Array.isArray(parent.fills))
+        fills = parent.fills.filter((f) => f.type !== "IMAGE" && f.type !== "VIDEO").map(paintToRest);
+    }
     node = {
       id: "selection",
       name: "Selection",
-      type: "GROUP",
+      type: backdrop.length || (fills && fills.length) ? "FRAME" : "GROUP",
       layoutMode: "NONE",
-      absoluteBoundingBox: { x, y, width: x2 - x, height: y2 - y },
-      children: sel.map((s) => serialize(s, ctx)),
+      absoluteBoundingBox: box,
+      ...(fills && fills.length ? { fills } : {}),
+      ...(backdrop.length || (fills && fills.length) ? { clipsContent: true } : {}),
+      children: [...backdrop, ...ordered].map((s) => serialize(s, ctx)),
     };
   }
 
@@ -880,20 +914,28 @@ async function run() {
           assets.push({ id: ref.id, kind: "svg", bytes });
         }
       } else if (ref.kind === "bg") {
-        // Export the container's photo fill alone: hide direct children, snap
-        // the PNG, then restore visibility (guarded so we never leave hidden).
-        const hidden = [];
-        for (const c of live.children || []) {
-          if (c.visible) {
-            c.visible = false;
-            hidden.push(c);
-          }
-        }
+        // Export the container's own fills without its children. Never hide the
+        // children to do it: toggling visibility re-flows a hugging frame, and
+        // constrained (Scale/Stretch) layers resized along with it do not come
+        // back where they were — the designer's file got damaged. Paint the
+        // fills onto a throwaway rectangle instead and delete it afterwards.
+        const rect = figma.createRectangle();
         try {
-          const bytes = await live.exportAsync({ format: "PNG", constraint: pngConstraint(live, 2048) });
+          rect.resize(Math.max(1, live.width), Math.max(1, live.height));
+          rect.x = -100000;
+          rect.y = -100000;
+          rect.fills = live.fills;
+          if (typeof live.cornerRadius === "number") rect.cornerRadius = live.cornerRadius;
+          else if (typeof live.topLeftRadius === "number") {
+            rect.topLeftRadius = live.topLeftRadius;
+            rect.topRightRadius = live.topRightRadius;
+            rect.bottomRightRadius = live.bottomRightRadius;
+            rect.bottomLeftRadius = live.bottomLeftRadius;
+          }
+          const bytes = await rect.exportAsync({ format: "PNG", constraint: pngConstraint(live, 2048) });
           assets.push({ id: ref.id, kind: "png", bytes });
         } finally {
-          for (const c of hidden) c.visible = true;
+          rect.remove();
         }
       } else {
         const bytes = await live.exportAsync({ format: "PNG", constraint: pngConstraint(live, 2048) });
@@ -904,13 +946,15 @@ async function run() {
     }
   }
 
-  // A flat PNG of the whole selection for the "Figma превью" tab.
+  // A flat PNG of the selection for the "Figma превью" tab. Read-only: the old
+  // multi-select path grouped the layers on the page and ungrouped them, which
+  // pulled them out of their frame for good and wrecked the designer's file.
+  // Several layers → the first one stands in (the preview is a convenience).
   let preview = null;
   try {
-    const top = sel.length === 1 ? sel[0] : figma.group(sel.slice(), figma.currentPage);
+    const top = sel[0];
     // The preview is only shown fit-to-panel — 1600px is plenty.
     preview = await top.exportAsync({ format: "PNG", constraint: pngConstraint(top, 1600) });
-    if (sel.length > 1 && top.type === "GROUP") figma.ungroup(top);
   } catch (e) {
     /* preview is optional */
   }

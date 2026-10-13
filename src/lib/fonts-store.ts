@@ -16,6 +16,8 @@ export interface StoredFace {
   fileName: string;
   family: string;
   weight: number;
+  /** upper end of a variable font's weight range */
+  weightMax?: number;
   style: "normal" | "italic";
   /** CSS src format token: woff2 / woff / truetype / opentype */
   format: string;
@@ -60,6 +62,7 @@ export async function saveFaces(
     fileName: string;
     family: string;
     weight: number;
+    weightMax?: number;
     style: "normal" | "italic";
     format: string;
     /** base64 payload — only for faces that are new to the store */
@@ -80,6 +83,7 @@ export async function saveFaces(
       fileName: f.fileName,
       family: f.family,
       weight: f.weight,
+      ...(f.weightMax ? { weightMax: f.weightMax } : {}),
       style: f.style,
       format: f.format,
     };
@@ -129,7 +133,7 @@ export async function buildCss(faces: StoredFace[], familiesInUse?: string[]): P
   for (const f of faces) {
     if (used && !used.has(norm(f.family))) continue;
     rules.push(
-      `@font-face {\n  font-family: "${f.family}";\n  font-style: ${f.style};\n  font-weight: ${f.weight};\n  font-display: swap;\n  src: url(${await dataUri(f)}) format("${f.format}");\n}`,
+      `@font-face {\n  font-family: "${f.family}";\n  font-style: ${f.style};\n  font-weight: ${f.weightMax ? `${f.weight} ${f.weightMax}` : f.weight};\n  font-display: swap;\n  src: url(${await dataUri(f)}) format("${f.format}");\n}`,
     );
   }
   return rules.join("\n");

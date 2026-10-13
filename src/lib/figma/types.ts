@@ -70,6 +70,8 @@ export interface FigmaNode {
   children?: FigmaNode[];
 
   absoluteBoundingBox?: FigmaRect;
+  /** visual bounds incl. strokes/effects — sent only for zero-width lines */
+  absoluteRenderBounds?: FigmaRect;
   /**
    * The node's own (un-rotated) width/height — x is width, y is height. For a
    * rotated node absoluteBoundingBox is the AABB of the *rotated* shape, from

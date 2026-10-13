@@ -1,4 +1,6 @@
 import { NextRequest } from "next/server";
+import { promises as fs } from "fs";
+import path from "path";
 import { publish } from "@/lib/plugin/bus";
 
 export const runtime = "nodejs";
@@ -29,6 +31,13 @@ export async function POST(req: NextRequest) {
     });
   }
   publish(text);
+  // Dev aid: keep the last payload so a bad conversion can be reproduced.
+  if (process.env.NODE_ENV === "development") {
+    const dir = path.join(process.cwd(), ".debug");
+    fs.mkdir(dir, { recursive: true })
+      .then(() => fs.writeFile(path.join(dir, "last-ingest.json"), text, "utf8"))
+      .catch(() => {});
+  }
   return new Response(JSON.stringify({ ok: true }), {
     status: 200,
     headers: { ...CORS, "Content-Type": "application/json" },

@@ -398,6 +398,72 @@ describe("converter: image scaleMode", () => {
     const n = frame({ fills: [{ type: "IMAGE", scaleMode: "FIT", imageRef: "abc" }] });
     expect(convertNode(n).html).toContain("object-contain");
   });
+
+  it("keeps the photo of a card that also has a gradient overlay", () => {
+    const n = frame({
+      fills: [
+        { type: "IMAGE", scaleMode: "FILL", imageRef: "abc" },
+        {
+          type: "GRADIENT_LINEAR",
+          gradientHandlePositions: [{ x: 0.5, y: 0 }, { x: 0.5, y: 1 }, { x: 0, y: 0 }],
+          gradientStops: [
+            { position: 0, color: { r: 0, g: 0, b: 0, a: 0.5 } },
+            { position: 1, color: { r: 0, g: 0, b: 0, a: 0 } },
+          ],
+        },
+      ],
+      children: [frame({ id: "c", absoluteBoundingBox: box(20, 20) })],
+    });
+    const { html } = convertNode(n);
+    expect(html).toContain("background-image");
+    expect(html).not.toContain("linear-gradient");
+  });
+
+  it("pushes absolute backdrop layers below the in-flow content", () => {
+    const n = frame({
+      layoutMode: "VERTICAL",
+      absoluteBoundingBox: box(400, 400),
+      children: [
+        frame({ id: "glow", layoutPositioning: "ABSOLUTE", absoluteBoundingBox: box(400, 400) }),
+        frame({ id: "content", absoluteBoundingBox: box(400, 100) }),
+        frame({ id: "badge", layoutPositioning: "ABSOLUTE", absoluteBoundingBox: box(20, 20) }),
+      ],
+    });
+    const html = convertNode(n).html;
+    expect(html).toContain("isolate");
+    expect(html.match(/-z-10/g)?.length).toBe(1); // the glow, not the badge on top
+  });
+
+  it("stretches a fixed child that spans its column parent", () => {
+    const n = frame({
+      layoutMode: "VERTICAL",
+      absoluteBoundingBox: box(1360, 600),
+      children: [frame({ id: "row", layoutMode: "HORIZONTAL", absoluteBoundingBox: box(1360, 300) })],
+    });
+    const html = convertNode(n).html;
+    expect(html.match(/w-\[1360px\]/g)?.length).toBe(1); // the root only
+    expect(html).toContain("w-full");
+  });
+
+  it("sizes an exported vector logo even when it hugs its contents", () => {
+    const n = frame({
+      layoutMode: "HORIZONTAL",
+      children: [
+        {
+          id: "logo",
+          name: "logo",
+          type: "FRAME",
+          layoutSizingHorizontal: "HUG",
+          layoutSizingVertical: "HUG",
+          absoluteBoundingBox: box(112, 24),
+          children: [{ id: "lv", name: "v", type: "VECTOR", absoluteBoundingBox: box(112, 24) }],
+        } as FigmaNode,
+      ],
+    });
+    const html = convertNode(n).html;
+    expect(html).toContain("w-[112px]");
+    expect(html).toContain("h-[24px]");
+  });
 });
 
 describe("converter: prototype reactions → links/buttons", () => {

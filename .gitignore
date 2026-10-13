@@ -43,3 +43,6 @@ next-env.d.ts
 
 # Отладочные выгрузки Figma API
 node*.json
+
+# Последняя выгрузка из плагина (dev)
+.debug/

@@ -16,6 +16,8 @@ export interface FontFace {
   family: string;
   /** 100–900 */
   weight: number;
+  /** upper end of a variable font's weight range (`font-weight: 100 900`) */
+  weightMax?: number;
   style: "normal" | "italic";
   /** CSS src format token: woff2 / woff / truetype / opentype */
   format: string;
@@ -65,6 +67,7 @@ export async function putFonts(
       fileName: f.fileName,
       family: f.family,
       weight: f.weight,
+      weightMax: f.weightMax,
       style: f.style,
       format: f.format,
       // A face read from disk keeps its blob; a freshly parsed one ships bytes.
@@ -92,7 +95,7 @@ export async function fetchFontCss(familiesInUse: string[]): Promise<string> {
   return (await res.json()).css ?? "";
 }
 
-export function faceId(family: string, weight: number, style: string): string {
+export function faceId(family: string, weight: number | string, style: string): string {
   return `${family.toLowerCase()}|${weight}|${style}`;
 }
 
@@ -131,29 +134,59 @@ function extOf(name: string): string {
 export function guessMeta(fileName: string): {
   family: string;
   weight: number;
+  weightMax?: number;
   style: "normal" | "italic";
 } {
   const stem = basename(fileName).replace(/\.[^.]+$/, "");
   const style: "normal" | "italic" = /italic|oblique/i.test(stem)
     ? "italic"
     : "normal";
+  // A variable font covers the whole axis: one face answers any weight the
+  // design asks for, including in-between ones like 450.
+  const variable = /variable|vf/i.test(stem);
   let weight = 400;
-  for (const [re, w] of WEIGHTS)
-    if (re.test(stem)) {
-      weight = w;
-      break;
-    }
+  // Numeric weights ("inter-500-latin", "euclid-flex-300").
+  const num = stem.match(/(?:^|[-_ ])([1-9]00)(?=$|[-_ .])/);
+  if (num) weight = Number(num[1]);
+  else
+    for (const [re, w] of WEIGHTS)
+      if (re.test(stem)) {
+        weight = w;
+        break;
+      }
   // Strip weight/style words and separators to recover the family name.
   const family = stem
     .replace(
-      /[-_ ]?(thin|hairline|extra[-_ ]?light|ultra[-_ ]?light|semi[-_ ]?bold|demi[-_ ]?bold|extra[-_ ]?bold|ultra[-_ ]?bold|light|regular|normal|book|medium|black|heavy|bold|italic|oblique)/gi,
+      /[-_ ]?(thin|hairline|extra[-_ ]?light|ultra[-_ ]?light|semi[-_ ]?bold|demi[-_ ]?bold|extra[-_ ]?bold|ultra[-_ ]?bold|extra[-_ ]?black|ultra[-_ ]?black|light|regular|normal|book|medium|black|heavy|bold|italic|oblique|variable|vf)(?=$|[-_ A-Z])/gi,
       "",
     )
+    .replace(/(?:^|[-_ ])[1-9]00(?=$|[-_ ])/g, "")
+    // Google-Fonts-style subset suffixes ("inter-400-cyrillic-ext")
+    .replace(/[-_ ](latin|cyrillic|greek|vietnamese)([-_ ]ext)?(?=$|[-_ ])/gi, "")
     .replace(/[-_]+/g, " ")
     // CamelCase → spaced ("PlayfairDisplay" → "Playfair Display")
     .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/\s+/g, " ")
     .trim();
+  if (variable) return { family: family || stem, weight: 100, weightMax: 900, style };
   return { family: family || stem, weight, style };
+}
+
+/** Families that ship both "Regular" and "Normal" (TT Norms, TT Commons…)
+ *  use Normal for the step between Regular and Medium — weight 450, which is
+ *  exactly what Figma reports for it. Re-weight those faces in place. */
+export function refineWeights<
+  T extends { fileName: string; family: string; weight: number; style: string; id: string; weightMax?: number },
+>(faces: T[]): T[] {
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const withRegular = new Set(
+    faces.filter((f) => /regular/i.test(f.fileName)).map((f) => norm(f.family)),
+  );
+  return faces.map((f) => {
+    if (f.weightMax || f.weight !== 400 || !/normal/i.test(f.fileName)) return f;
+    if (!withRegular.has(norm(f.family))) return f;
+    return { ...f, weight: 450, id: faceId(f.family, 450, f.style) };
+  });
 }
 
 /** Snap a guessed family to one of the design's real family strings when they
@@ -225,9 +258,10 @@ function makeFace(name: string, bytes: Uint8Array): FontFace | null {
   const ext = extOf(name);
   const format = EXT_FORMAT[ext];
   if (!format) return null;
-  const { family, weight, style } = guessMeta(name);
+  const { family, weight, weightMax, style } = guessMeta(name);
   const dataUri = `data:font/${ext};base64,${bytesToBase64(bytes)}`;
-  return { id: faceId(family, weight, style), fileName: basename(name), family, weight, style, format, dataUri };
+  const id = faceId(family, weightMax ? `${weight}-${weightMax}` : weight, style);
+  return { id, fileName: basename(name), family, weight, weightMax, style, format, dataUri };
 }
 
 /** Turn a user file selection (font files and/or .zip archives) into faces. */
@@ -248,7 +282,7 @@ export async function readFontFiles(files: FileList | File[]): Promise<FontFace[
       if (f) faces.push(f);
     }
   }
-  return faces;
+  return refineWeights(faces);
 }
 
 // ---- @font-face CSS -------------------------------------------------------
@@ -265,7 +299,7 @@ export function buildFontFaceCss(
     .filter((f) => f.dataUri && (!used || used.has(norm(f.family))))
     .map(
       (f) =>
-        `@font-face {\n  font-family: "${f.family}";\n  font-style: ${f.style};\n  font-weight: ${f.weight};\n  font-display: swap;\n  src: url(${f.dataUri}) format("${f.format}");\n}`,
+        `@font-face {\n  font-family: "${f.family}";\n  font-style: ${f.style};\n  font-weight: ${f.weightMax ? `${f.weight} ${f.weightMax}` : f.weight};\n  font-display: swap;\n  src: url(${f.dataUri}) format("${f.format}");\n}`,
     );
   return rules.join("\n");
 }

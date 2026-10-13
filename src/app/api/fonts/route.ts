@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { readIndex, saveFaces, buildCss } from "@/lib/fonts-store";
-import { faceId, guessMeta } from "@/lib/fonts";
+import { faceId, guessMeta, refineWeights } from "@/lib/fonts";
 
 export const runtime = "nodejs";
 
@@ -60,19 +60,20 @@ export async function POST(req: NextRequest) {
           skipped.push(item.fileName ?? "?");
           continue;
         }
-        const { family, weight, style } = guessMeta(item.fileName);
-        const id = faceId(family, weight, style);
+        const { family, weight, weightMax, style } = guessMeta(item.fileName);
+        const id = faceId(family, weightMax ? `${weight}-${weightMax}` : weight, style);
         merged.set(id, {
           id,
           fileName: item.fileName,
           family,
           weight,
+          weightMax,
           style,
           format,
           base64: item.base64,
         });
       }
-      const faces = await saveFaces([...merged.values()]);
+      const faces = await saveFaces(refineWeights([...merged.values()]));
       return NextResponse.json({ faces, skipped }, { headers: CORS });
     }
 
